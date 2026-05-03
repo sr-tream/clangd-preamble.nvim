@@ -1,0 +1,150 @@
+*clangd-preamble.txt*  Inject TU preambles into clangd for non-self-contained headers
+
+Author:  SR_team <me@sr.team>
+License: MIT
+
+==============================================================================
+CONTENTS                                              *clangd-preamble-contents*
+
+  1. Intro ................................. |clangd-preamble-intro|
+  2. Requirements .......................... |clangd-preamble-requirements|
+  3. Setup ................................. |clangd-preamble-setup|
+  4. API ................................... |clangd-preamble-api|
+  5. Commands .............................. |clangd-preamble-commands|
+  6. How it works .......................... |clangd-preamble-internals|
+  7. Caveats ............................... |clangd-preamble-caveats|
+
+==============================================================================
+1. Intro                                                 *clangd-preamble-intro*
+
+Make non-self-contained C/C++ headers parse cleanly under clangd. The plugin
+hooks outgoing `textDocument/didOpen` for `.cpp/.cc/...` files to build a
+TU->header include graph, synthesizes a fake preamble from a recently-seen
+includer when the user opens a header, prepends it to the buffer text sent to
+clangd, and bidirectionally remaps line/col positions across LSP traffic so
+the unmodified header is what the user sees.
+
+The preamble is wrapped in `#if __INCLUDE_LEVEL__ == 0 ... #endif` so it's
+only active when clangd parses the header as the translation root.
+
+==============================================================================
+2. Requirements                                  *clangd-preamble-requirements*
+
+  - Neovim 0.10+ (vim.uv, vim.fs, vim.lsp.handlers)
+  - clangd via nvim-lspconfig or vim.lsp.start
+
+==============================================================================
+3. Setup                                                 *clangd-preamble-setup*
+
+The plugin does not auto-attach. Wire it from your clangd `on_attach` callback
+so it sees every clangd LSP client at attach time. With nvim-lspconfig: >lua
+
+  {
+    "neovim/nvim-lspconfig",
+    opts = {
+      servers = {
+        clangd = {
+          on_attach = function(client, bufnr)
+            require("clangd-preamble").attach(client, bufnr)
+          end,
+        },
+      },
+    },
+  }
+<
+
+If you also use other middleware that wraps `client.request`/`client.notify`,
+install clangd-preamble *after* it so the preamble layer sits as the outermost
+wrapper.
+
+==============================================================================
+4. API                                                     *clangd-preamble-api*
+
+                                                  *clangd-preamble.attach()*
+require("clangd-preamble").attach({client}, {bufnr})
+
+  Wraps {client}'s `request`/`notify`, installs the diagnostics/applyEdit/
+  showDocument handlers (idempotent across clients), and replays the first
+  buffer's `didOpen` (which fired before on_attach ran) so the preamble
+  injection sees it. Safe to call from on_attach for every buffer; subsequent
+  calls for the same client are no-ops.
+
+                                              *clangd-preamble.includer_for()*
+require("clangd-preamble").includer_for([{bufnr}])
+
+  Returns the path of the includer TU chosen for {bufnr} (or current buffer if
+  omitted), or nil if no preamble is active. Useful for statusline integration.
+
+==============================================================================
+5. Commands                                           *clangd-preamble-commands*
+
+                                                       *:NoSelfContainedDisable*
+                                                        *:NoSelfContainedEnable*
+:NoSelfContainedDisable
+:NoSelfContainedEnable
+  Global on/off. When off, traffic passes through unchanged.
+
+                                                    *:NoSelfContainedDisableBuf*
+                                                     *:NoSelfContainedEnableBuf*
+:NoSelfContainedDisableBuf
+:NoSelfContainedEnableBuf
+  Per-buffer override. Disable strips the preamble and forces a clean re-open
+  for the current buffer. Enable forces preamble injection even on headers
+  the self-contained heuristic would otherwise skip.
+
+                                                       *:NoSelfContainedRefresh*
+:NoSelfContainedRefresh
+  Re-pick the includer TU, rebuild the preamble, replay didOpen. Use after
+  editing the includer TU's includes.
+
+                                                        *:NoSelfContainedStatus*
+:NoSelfContainedStatus
+  Print state for the current buffer.
+
+                                                     *:NoSelfContainedDumpGraph*
+:NoSelfContainedDumpGraph
+  Dump the observed TU/header graph.
+
+                                               *:NoSelfContainedDumpDiagnostics*
+:NoSelfContainedDumpDiagnostics
+  Dump diagnostics suppressed because they fell in the preamble.
+
+                                                  *:NoSelfContainedScanProject*
+:NoSelfContainedScanProject
+  Walk the current working directory for `.cpp/.cc/...` files and observe
+  their includes. Useful when no TU has been opened yet.
+
+==============================================================================
+6. How it works                                      *clangd-preamble-internals*
+
+  1. Outgoing didOpen for TUs is intercepted; #includes parsed into a graph.
+  2. Header didOpen queries the graph for the TU with the shortest
+     prefix-before-this-header (tie-break: most recent). Companion TU
+     (Foo.cpp next to Foo.h) is the fallback.
+  3. Headers with >= 3 own #include directives are auto-skipped (likely
+     self-contained). Manual commands override via force=true.
+  4. Each prefix entry is checked 1 level deep against the target header's
+     basename; entries that transitively re-include the target are dropped.
+  5. Prefix entries duplicating the header's own #includes are dropped.
+  6. The remaining entries are wrapped in `#if __INCLUDE_LEVEL__ == 0 ...
+     #endif` and prepended to didOpen.text.
+  7. ~30 LSP methods get bidirectional position/range shifts so the user
+     sees user-space coordinates.
+  8. publishDiagnostics: drops fully-in-preamble, clips straddling, shifts
+     survivors. Dropped entries kept for the dump command.
+  9. Pending-header replay: a header opened before any TU is observed gets
+     its original didOpen stashed; when a TU later populates the graph with
+     a basename match, the stored open is replayed.
+
+==============================================================================
+7. Caveats                                              *clangd-preamble-caveats*
+
+  - Header opened alone with no companion .cpp and no observed TU passes
+    through (no preamble) until either a TU is observed or
+    :NoSelfContainedScanProject is run.
+  - Pull-diagnostics (`textDocument/diagnostic`) is not yet handled; rely on
+    push for now.
+  - Headers in two distinct buffers via different paths to the same file
+    are treated as separate buffers (each gets its own state).
+
+vim:tw=78:ts=8:ft=help:norl:
