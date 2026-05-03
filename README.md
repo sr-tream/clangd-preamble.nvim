@@ -2,6 +2,10 @@
 
 Make non-self-contained C/C++ headers parse cleanly under clangd.
 
+![Demo](./demo.png)
+
+
+
 When a header relies on transitive includes from its TU's preamble (`std::string_view`
 without `#include <string_view>`, `CObject` forward-decls without the full type, etc.),
 clangd parsed alone produces a cascade of false-positive errors, broken hover, broken
