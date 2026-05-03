@@ -24,6 +24,9 @@ end
 local function on_header_detached(st)
   M._buf_state[st.bufnr] = nil
   lsp.clear_semtok(st.bufnr)
+  -- Virtual companion cleanup is handled by BufWipeout/BufUnload so that
+  -- reissue_open (didClose + didOpen) doesn't close and re-open the companion
+  -- mid-cycle, which would reset the pch_ready flag and loop.
 end
 
 local function reissue_open(client, bufnr, path, uri)
@@ -50,12 +53,34 @@ local function try_promote_pending(client)
         local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
         for _, c in ipairs(clients) do
           if c.id == client.id then
-            if graph.find_includer(path) then
+            local inc = graph.find_includer(path)
+            if inc then
               local uri = vim.uri_from_fname(path)
               reissue_open(c, bn, path, uri)
+              lsp.send_fake_change(c, bn, uri)
             end
             break
           end
+        end
+      end
+    end
+  end
+end
+
+-- Re-issue didOpen for headers that already have state but whose includer
+-- just became live in clangd (editor open). The companion-from-disk path
+-- builds the preamble before clangd has a PCH for the TU, leaving residual
+-- diagnostics. Reissuing after the TU's didOpen lets clangd re-analyze the
+-- header with its freshly compiled PCH context.
+local function try_refresh_existing(client, tu_path)
+  for bn, st in pairs(M._buf_state) do
+    if st.includer_tu == tu_path then
+      local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
+      for _, c in ipairs(clients) do
+        if c.id == client.id then
+          reissue_open(c, bn, st.header_path, st.header_uri)
+          lsp.send_fake_change(c, bn, st.header_uri)
+          break
         end
       end
     end
@@ -69,7 +94,19 @@ CTX.on_header_attached    = on_header_attached
 CTX.on_header_detached    = on_header_detached
 -- Promotion can be heavy (disk I/O for every pending header), so defer it
 -- off the wrapped-notify path to keep didOpen responsive.
-CTX.on_tu_observed        = function(client) vim.schedule(function() try_promote_pending(client) end) end
+CTX.on_tu_observed        = function(client, tu_path)
+  vim.schedule(function()
+    try_promote_pending(client)
+    if tu_path then try_refresh_existing(client, tu_path) end
+  end)
+end
+
+-- Called by lsp.lua when the companion's first publishDiagnostics arrives,
+-- meaning clangd has built its PCH. Re-issue all headers that were analyzed
+-- before that PCH was ready.
+lsp._on_virtual_tu_ready = function(client, tu_path)
+  try_refresh_existing(client, tu_path)
+end
 
 function M.includer_for(bufnr)
   local st = M._buf_state[bufnr or vim.api.nvim_get_current_buf()]
@@ -123,9 +160,19 @@ vim.api.nvim_create_autocmd("LspDetach", {
 vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
   group = M._autogroup,
   callback = function(args)
-    if M._buf_state[args.buf] then
+    local st = M._buf_state[args.buf]
+    if st then
       M._buf_state[args.buf] = nil
       lsp.clear_semtok(args.buf)
+      -- Close virtual companion if no other header still uses it.
+      local tu = st.includer_tu
+      if tu and lsp._virtual_tus[tu] then
+        local still_used = false
+        for _, other in pairs(M._buf_state) do
+          if other.includer_tu == tu then still_used = true; break end
+        end
+        if not still_used then lsp.close_tu_virtually(tu) end
+      end
     end
   end,
 })

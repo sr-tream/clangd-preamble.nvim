@@ -684,9 +684,19 @@ function M.install_handlers(get_state_for_uri, all_states)
     if result and result.uri and ctx and ctx.client_id then
       local cli = vim.lsp.get_client_by_id(ctx.client_id)
       if cli and cli.name == "clangd" then
+        local path = uri_to_path(result.uri)
         local st = get_state_for_uri(result.uri)
         if st then
           result.diagnostics = process_diagnostics(result.diagnostics or {}, st)
+        end
+        -- Companion's first publishDiagnostics means its PCH is ready.
+        -- Fire the callback once so init.lua can re-issue any header that
+        -- was analyzed before the PCH was available.
+        local vt = M._virtual_tus[path]
+        if vt and not vt.pch_ready then
+          vt.pch_ready = true
+          local cb = M._on_virtual_tu_ready
+          if cb then vim.schedule(function() cb(cli, path) end) end
         end
       end
     end
@@ -714,6 +724,68 @@ function M.install_handlers(get_state_for_uri, all_states)
     end
     if orig_show then return orig_show(err, result, ctx, config) end
   end
+end
+
+-- ====================================================================
+-- Virtual companion TU open.
+-- When a header's companion is found from disk (not yet open in the editor),
+-- we open it in clangd via orig_notify so clangd builds its PCH and applies
+-- the companion's compile_commands flags to the header analysis.
+-- We track virtual opens so the real didOpen from the user is suppressed.
+-- ====================================================================
+
+-- tu_path -> { uri, client_self, orig_notify, pch_ready }
+-- pch_ready becomes true after the first publishDiagnostics arrives for the
+-- companion, which signals clangd has finished its analysis and the PCH is
+-- usable.  The on_virtual_tu_ready callback fires exactly once per companion.
+M._virtual_tus = {}
+M._on_virtual_tu_ready = nil  -- set from init.lua
+
+function M.open_tu_virtually(client_self, orig_notify_fn, tu_path)
+  if M._virtual_tus[tu_path] then return end
+  local f = io.open(tu_path, "r")
+  if not f then return end
+  local text = f:read("*a"); f:close()
+  local uri = vim.uri_from_fname(tu_path)
+  local ext = tu_path:match("%.([^.]+)$") or "cpp"
+  local lang = (ext == "c" or ext == "C") and "c" or "cpp"
+  orig_notify_fn(client_self, "textDocument/didOpen", {
+    textDocument = { uri = uri, languageId = lang, version = 0, text = text },
+  })
+  M._virtual_tus[tu_path] = {
+    uri = uri, client_self = client_self, orig_notify = orig_notify_fn, pch_ready = false,
+  }
+end
+
+function M.close_tu_virtually(tu_path)
+  local vt = M._virtual_tus[tu_path]
+  if not vt then return end
+  vt.orig_notify(vt.client_self, "textDocument/didClose", { textDocument = { uri = vt.uri } })
+  M._virtual_tus[tu_path] = nil
+end
+
+-- Returns true and drops the virtual record when the user opens the same TU
+-- for real — clangd already has it open, so the caller must skip orig_notify.
+function M.promote_virtual_tu(tu_path)
+  if not M._virtual_tus[tu_path] then return false end
+  M._virtual_tus[tu_path] = nil
+  return true
+end
+
+-- ====================================================================
+-- Fake didChange — force clangd to push fresh publishDiagnostics after
+-- a preamble injection (didClose + didOpen alone may not trigger a push).
+-- ====================================================================
+function M.send_fake_change(client, bufnr, uri)
+  if not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local eol   = vim.bo[bufnr].endofline and "\n" or ""
+  local ver   = (vim.lsp.util.buf_versions[bufnr] or 0) + 1
+  vim.lsp.util.buf_versions[bufnr] = ver
+  client:notify("textDocument/didChange", {
+    textDocument   = { uri = uri, version = ver },
+    contentChanges = { { text = table.concat(lines, "\n") .. eol } },
+  })
 end
 
 -- ====================================================================
@@ -772,6 +844,13 @@ function M.wrap_client(client, ctx)
           if includer then
             local bn = vim.fn.bufnr(path)
             if bn > 0 then
+              -- Open the companion TU in clangd before the header so clangd
+              -- builds its PCH and applies the companion's compile flags to
+              -- the header analysis. Only needed when companion was found
+              -- from disk (not already live in the editor).
+              if vim.fn.bufnr(includer.tu_path) <= 0 then
+                M.open_tu_virtually(self, orig_notify, includer.tu_path)
+              end
               local st = M.build_state(bn, td.uri, path, includer)
               ctx.on_header_attached(st)
               params = vim.deepcopy(params)
@@ -779,8 +858,12 @@ function M.wrap_client(client, ctx)
             end
           end
         elseif is_tu_path(path) and td.text then
+          -- If this TU was virtually opened by us, clangd already has it —
+          -- skip orig_notify but still observe the live text and notify.
+          local already_open = M.promote_virtual_tu(path)
           graph.observe_tu(path, td.text)
-          if ctx.on_tu_observed then ctx.on_tu_observed(self) end
+          if ctx.on_tu_observed then ctx.on_tu_observed(self, path) end
+          if already_open then return end
         end
       end
     elseif method == "textDocument/didChange" then
