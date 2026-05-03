@@ -90,6 +90,7 @@ end
 CTX.is_enabled            = is_enabled
 CTX.get_state_for_bufnr   = get_state_for_bufnr
 CTX.get_state_for_uri     = get_state_for_uri
+CTX.all_states            = all_states
 CTX.on_header_attached    = on_header_attached
 CTX.on_header_detached    = on_header_detached
 -- Promotion can be heavy (disk I/O for every pending header), so defer it

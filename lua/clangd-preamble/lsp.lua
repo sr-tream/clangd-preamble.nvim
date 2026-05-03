@@ -772,6 +772,19 @@ function M.promote_virtual_tu(tu_path)
   return true
 end
 
+-- Track a TU as virtually open without sending didOpen — clangd already has
+-- the file open from the user's prior didOpen. Caller must suppress the
+-- matching didClose so clangd keeps its PCH alive for active headers.
+function M.demote_to_virtual(client_self, orig_notify_fn, tu_path, uri)
+  if M._virtual_tus[tu_path] then return end
+  M._virtual_tus[tu_path] = {
+    uri = uri,
+    client_self = client_self,
+    orig_notify = orig_notify_fn,
+    pch_ready = true,
+  }
+end
+
 -- ====================================================================
 -- Fake didChange — force clangd to push fresh publishDiagnostics after
 -- a preamble injection (didClose + didOpen alone may not trigger a push).
@@ -880,8 +893,25 @@ function M.wrap_client(client, ctx)
     elseif method == "textDocument/didClose" then
       local td = params and params.textDocument
       if td and td.uri then
-        local st = ctx.get_state_for_uri(td.uri)
-        if st then ctx.on_header_detached(st) end
+        local path = uri_to_path(td.uri)
+        if is_tu_path(path) then
+          -- If any active header still uses this TU as its includer, keep it
+          -- open in clangd virtually — header diagnostics depend on the
+          -- companion's PCH, which clangd would drop on didClose.
+          local has_user = false
+          if ctx.all_states then
+            for _, st in pairs(ctx.all_states()) do
+              if st.includer_tu == path then has_user = true; break end
+            end
+          end
+          if has_user then
+            M.demote_to_virtual(self, orig_notify, path, td.uri)
+            return
+          end
+        else
+          local st = ctx.get_state_for_uri(td.uri)
+          if st then ctx.on_header_detached(st) end
+        end
       end
     end
 
