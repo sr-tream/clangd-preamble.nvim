@@ -134,6 +134,22 @@ end)
 assert_contains(state_text(widget_buf), '#include "config_b.h"', "fixed config preamble")
 assert_contains(state_text(widget_buf), '#include "preamble_b.h"', "fixed b preamble")
 
+preamble.setup({ default_selector = "last_seen" })
+assert_eq(preamble.default_selector(), "last_seen", "default selector last_seen")
+assert_true(preamble.use_auto_includer(widget_buf), "last-seen default reissue")
+wait_for("Widget.h did not switch to default last-seen consumer_b", function()
+  return preamble.includer_for(widget_buf) == consumer_b
+end)
+assert_contains(state_text(widget_buf), '#include "preamble_b.h"', "default last-seen preamble")
+
+preamble.setup({ default_selector = "preamble_size" })
+assert_eq(preamble.default_selector(), "preamble_size", "default selector preamble_size")
+assert_true(preamble.use_auto_includer(widget_buf), "preamble-size default reissue")
+wait_for("Widget.h did not switch to default preamble-size consumer_a", function()
+  return preamble.includer_for(widget_buf) == consumer_a
+end)
+assert_contains(state_text(widget_buf), '#include "preamble_a.h"', "default preamble-size preamble")
+
 assert_true(preamble.use_recent_includer(widget_buf), "recent includer reissue")
 wait_for("Widget.h did not switch to recent consumer_b", function()
   return preamble.includer_for(widget_buf) == consumer_b

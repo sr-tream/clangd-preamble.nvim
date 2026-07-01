@@ -10,8 +10,20 @@ M._disabled_uris = {}
 M._forced_uris = {}
 M._preferred_includers = {}
 M._recent_includer_uris = {}
+M._config = { default_selector = "preamble_size" }
 M._autogroup = vim.api.nvim_create_augroup("ClangdPreamble", { clear = true })
 local last_active_tu_path = nil
+
+local function normalize_default_selector(value)
+  if value == "last_seen" or value == "lastSeen" or value == "recent" then
+    return "last_seen"
+  end
+  return "preamble_size"
+end
+
+local function default_selector_label()
+  return M._config.default_selector == "last_seen" and "last seen" or "preamble size"
+end
 
 local function get_state_for_bufnr(bufnr) return M._buf_state[bufnr] end
 local function get_state_for_uri(uri)
@@ -49,6 +61,11 @@ end
 
 local function clear_disabled(uri) M._disabled_uris[uri] = nil end
 
+local function uses_recent_selector(uri)
+  if M._preferred_includers[uri] then return false end
+  return M._recent_includer_uris[uri] == true or M._config.default_selector == "last_seen"
+end
+
 local function find_header_includer(path, uri, force)
   local preferred = M._preferred_includers[uri]
   if preferred then
@@ -57,6 +74,10 @@ local function find_header_includer(path, uri, force)
   if M._recent_includer_uris[uri] then
     return graph.find_recent_includer(path, { force = true })
         or graph.find_includer(path, { force = true })
+  end
+  if M._config.default_selector == "last_seen" then
+    return graph.find_recent_includer(path, { force = force })
+        or graph.find_includer(path, { force = force })
   end
   return graph.find_includer(path, { force = force })
 end
@@ -145,7 +166,7 @@ end
 
 local function reissue_recent_header_if_changed(bufnr)
   local uri, path = uri_for_bufnr(bufnr)
-  if not uri or not path or not M._recent_includer_uris[uri] or M._disabled_uris[uri] then return false end
+  if not uri or not path or M._disabled_uris[uri] or not uses_recent_selector(uri) then return false end
   local recent = graph.find_recent_includer(path, { force = true })
   if not recent then return false end
   local st = M._buf_state[bufnr]
@@ -162,7 +183,7 @@ local function reissue_recent_headers_for_tu(tu_path)
   for _, bn in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(bn) and vim.api.nvim_buf_is_loaded(bn) then
       local uri, path = uri_for_bufnr(bn)
-      if uri and path and lsp.is_header_path(path) and M._recent_includer_uris[uri] then
+      if uri and path and lsp.is_header_path(path) and uses_recent_selector(uri) then
         local recent = graph.find_recent_includer(path, { force = true })
         if recent and recent.tu_path == tu_path then reissue_recent_header_if_changed(bn) end
       end
@@ -208,6 +229,17 @@ end
 -- before that PCH was ready.
 lsp._on_virtual_tu_ready = function(client, tu_path)
   try_refresh_existing(client, tu_path)
+end
+
+function M.setup(opts)
+  opts = opts or {}
+  if opts.default_selector ~= nil then
+    M._config.default_selector = normalize_default_selector(opts.default_selector)
+  end
+end
+
+function M.default_selector()
+  return M._config.default_selector
 end
 
 function M.includer_for(bufnr)
@@ -411,12 +443,14 @@ vim.api.nvim_create_user_command("NoSelfContainedSelectIncluder", function()
   local current = M.includer_for(bn)
   local auto = graph.find_includer(path, { force = true })
   local recent = graph.find_recent_includer(path, { force = true })
+  local configured_default = M._config.default_selector == "last_seen" and (recent or auto) or auto
   local items = {
     {
       kind = "auto",
-      label = ("%sAuto-select best includer%s"):format(
+      label = ("%sUse configured default (%s)%s"):format(
         mode == "auto" and "* " or "  ",
-        auto and (" (" .. workspace_relative(auto.tu_path) .. ")") or ""),
+        default_selector_label(),
+        configured_default and (" (" .. workspace_relative(configured_default.tu_path) .. ")") or ""),
     },
     {
       kind = "recent",
@@ -478,7 +512,8 @@ vim.api.nvim_create_user_command("NoSelfContainedStatus", function()
     if mode == "fixed" then
       table.insert(lines, ("selection: fixed (%s)"):format(preferred))
     else
-      table.insert(lines, ("selection: %s"):format(mode == "recent" and "last seen" or "auto"))
+      table.insert(lines, ("selection: %s"):format(
+        mode == "recent" and "last seen" or ("default (" .. default_selector_label() .. ")")))
     end
     table.insert(lines, ("includer candidates: %d"):format(#graph.list_includers(path, { force = true })))
   end

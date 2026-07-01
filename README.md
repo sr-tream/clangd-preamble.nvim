@@ -74,6 +74,17 @@ If you have other middleware that also wraps `client.request` / `client.notify`
 (e.g. a URI-scheme filter), install `clangd-preamble` **after** it so the preamble
 layer sits as the outermost wrapper.
 
+Optional setup:
+
+```lua
+require("clangd-preamble").setup({
+  -- "preamble_size" keeps the current default: pick the includer with the
+  -- smallest include prefix before the header. "last_seen" follows the most
+  -- recently observed includer TU instead.
+  default_selector = "preamble_size",
+})
+```
+
 ## Statusline
 
 Show the active includer TU in your statusline:
@@ -109,11 +120,13 @@ table.insert(opts.sections.lualine_x, 1, { clangd_preamble, color = { fg = "#7aa
 1. **Include graph.** Outgoing `didOpen` for `.cpp/.cc/.cxx/.c` files is
    intercepted; the file's `#include` directives are parsed into a TU↔header
    graph indexed by basename.
-2. **Includer pick.** When the user opens a header, the graph is queried for
+2. **Includer pick.** When the user opens a header, the default selector picks
    the TU with the **shortest prefix-before-this-header** (tie-break: most
-   recent observation). `:NoSelfContainedSelectIncluder` can pin a specific
-   TU or switch the header to the most recently observed includer. Companion-TU
-   fallback (`Foo.cpp` next to `Foo.h`) covers the header-opened-alone case.
+   recent observation). `setup({ default_selector = "last_seen" })` can instead
+   make the default follow the most recently observed includer TU.
+   `:NoSelfContainedSelectIncluder` can pin a specific TU or switch the header
+   to last-seen mode. Companion-TU fallback (`Foo.cpp` next to `Foo.h`) covers
+   the header-opened-alone case.
 3. **Self-contained skip.** Headers with **3 or more own `#include`
    directives** are likely self-contained and skipped automatically — the
    preamble can only introduce conflicts in that case. Manual commands

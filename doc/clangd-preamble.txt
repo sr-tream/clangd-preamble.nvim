@@ -57,8 +57,27 @@ If you also use other middleware that wraps `client.request`/`client.notify`,
 install clangd-preamble *after* it so the preamble layer sits as the outermost
 wrapper.
 
+Optional setup: >lua
+
+  require("clangd-preamble").setup({
+    -- "preamble_size" picks the includer with the smallest include prefix.
+    -- "last_seen" follows the most recently observed includer TU.
+    default_selector = "preamble_size",
+  })
+<
+
 ==============================================================================
 4. API                                                     *clangd-preamble-api*
+
+                                                    *clangd-preamble.setup()*
+require("clangd-preamble").setup({opts})
+
+  Configure plugin behavior. Supported options:
+
+    default_selector ~
+      "preamble_size" (default) chooses the includer TU with the smallest
+      include prefix before the header. "last_seen" chooses the most recently
+      observed includer TU that can include the header.
 
                                                   *clangd-preamble.attach()*
 require("clangd-preamble").attach({client}, {bufnr})
@@ -74,6 +93,11 @@ require("clangd-preamble").includer_for([{bufnr}])
 
   Returns the path of the includer TU chosen for {bufnr} (or current buffer if
   omitted), or nil if no preamble is active. Useful for statusline integration.
+
+                                           *clangd-preamble.default_selector()*
+require("clangd-preamble").default_selector()
+
+  Returns the configured default selector: "preamble_size" or "last_seen".
 
 ==============================================================================
 5. Commands                                           *clangd-preamble-commands*
@@ -124,9 +148,10 @@ require("clangd-preamble").includer_for([{bufnr}])
 
   1. Outgoing didOpen for TUs is intercepted; #includes parsed into a graph.
   2. Header didOpen queries the graph for the TU with the shortest
-     prefix-before-this-header (tie-break: most recent). Headers can also pin
-     a specific includer TU or use the last seen includer TU. Companion TU
-     (Foo.cpp next to Foo.h) is the fallback.
+     prefix-before-this-header (tie-break: most recent) by default. Setup can
+     change the default to last-seen. Headers can also pin a specific includer
+     TU or use the last seen includer TU. Companion TU (Foo.cpp next to Foo.h)
+     is the fallback.
   3. Headers with >= 3 own #include directives are auto-skipped (likely
      self-contained). Manual commands override via force=true.
   4. Each prefix entry is checked 1 level deep against the target header's
