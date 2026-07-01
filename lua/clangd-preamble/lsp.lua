@@ -30,7 +30,13 @@ local function shift_range(r, n)
   shift_pos(r["end"], n)
 end
 
-local function same_uri(a, b) return a == b end
+local function same_uri(a, b)
+  if not a or not b then return false end
+  if a == b then return true end
+  local ok_a, path_a = pcall(vim.uri_to_fname, a)
+  local ok_b, path_b = pcall(vim.uri_to_fname, b)
+  return ok_a and ok_b and path_a == path_b
+end
 
 -- Drop or clip a range against a preamble boundary. Returns true if fully dropped.
 local function clip_to_user(r, n)
@@ -47,7 +53,8 @@ end
 -- WorkspaceEdit walker
 -- ====================================================================
 local function walk_workspace_edit(we, header_uri, n, dir)
-  if not we then return end
+  if not we then return 0 end
+  local shifted = 0
   local function process_edits(edits)
     if not edits then return edits end
     if dir < 0 then
@@ -55,6 +62,7 @@ local function walk_workspace_edit(we, header_uri, n, dir)
       for _, e in ipairs(edits) do
         if e.range and not clip_to_user(e.range, n) then
           shift_range(e.range, dir * n)
+          shifted = shifted + 1
           table.insert(out, e)
         elseif not e.range then
           table.insert(out, e)
@@ -62,7 +70,12 @@ local function walk_workspace_edit(we, header_uri, n, dir)
       end
       return out
     else
-      for _, e in ipairs(edits) do shift_range(e.range, dir * n) end
+      for _, e in ipairs(edits) do
+        if e.range then
+          shift_range(e.range, dir * n)
+          shifted = shifted + 1
+        end
+      end
       return edits
     end
   end
@@ -78,6 +91,53 @@ local function walk_workspace_edit(we, header_uri, n, dir)
       end
     end
   end
+  return shifted
+end
+
+local function shift_workspace_edit_for_states(we, states, dir)
+  local shifted = 0
+  if not states then return shifted end
+  for _, st in pairs(states) do
+    if st.active then
+      shifted = shifted + walk_workspace_edit(we, st.header_uri, st.preamble_lines, dir)
+    end
+  end
+  return shifted
+end
+
+local function shift_code_action_edits_for_states(actions, states)
+  local shifted = 0
+  if type(actions) ~= "table" then return shifted end
+  for _, action in ipairs(actions) do
+    if action.edit then
+      shifted = shifted + shift_workspace_edit_for_states(action.edit, states, -1)
+    end
+  end
+  return shifted
+end
+
+local function shift_code_action_diagnostics(actions, st)
+  if type(actions) ~= "table" then return end
+  for _, action in ipairs(actions) do
+    if action.diagnostics then
+      for _, d in ipairs(action.diagnostics) do shift_range(d.range, -st.preamble_lines) end
+    end
+  end
+end
+
+local function remap_workspace_edit_result(result, ctx)
+  if result and ctx.all_states then
+    shift_workspace_edit_for_states(result, ctx.all_states(), -1)
+  end
+  return result
+end
+
+local function remap_code_action_result(result, ctx, st)
+  if result and ctx.all_states then
+    shift_code_action_edits_for_states(result, ctx.all_states())
+  end
+  if result and st then shift_code_action_diagnostics(result, st) end
+  return result
 end
 
 -- ====================================================================
@@ -708,9 +768,7 @@ function M.install_handlers(get_state_for_uri, all_states)
     if ctx and ctx.client_id and result and result.edit then
       local cli = vim.lsp.get_client_by_id(ctx.client_id)
       if cli and cli.name == "clangd" then
-        for _, st in pairs(all_states()) do
-          walk_workspace_edit(result.edit, st.header_uri, st.preamble_lines, -1)
-        end
+        shift_workspace_edit_for_states(result.edit, all_states(), -1)
       end
     end
     if orig_apply then return orig_apply(err, result, ctx, config) end
@@ -816,12 +874,30 @@ function M.wrap_client(client, ctx)
       return orig_request(self, method, params, handler, bufnr)
     end
 
+    local function wrap_response(user_handler, mapper)
+      return function(err, result, ctx2, config)
+        if err == nil and result ~= nil then
+          result = mapper(result)
+        end
+        if user_handler then return user_handler(err, result, ctx2, config) end
+      end
+    end
+
     local st
     if bufnr and bufnr ~= 0 then st = ctx.get_state_for_bufnr(bufnr) end
     if not st and params and params.textDocument and params.textDocument.uri then
       st = ctx.get_state_for_uri(params.textDocument.uri)
     end
     if not st or not st.active then
+      if method == "textDocument/codeAction" then
+        return orig_request(self, method, params, wrap_response(handler, function(result)
+          return remap_code_action_result(result, ctx, nil)
+        end), bufnr)
+      elseif method == "textDocument/rename" then
+        return orig_request(self, method, params, wrap_response(handler, function(result)
+          return remap_workspace_edit_result(result, ctx)
+        end), bufnr)
+      end
       return orig_request(self, method, params, handler, bufnr)
     end
 
@@ -834,13 +910,18 @@ function M.wrap_client(client, ctx)
     local in_fn = IN[method]
     local user_handler = handler
     local wrapped = user_handler
-    if in_fn then
-      wrapped = function(err, result, ctx2, config)
-        if err == nil and result ~= nil then
-          result = in_fn(result, st)
-        end
-        if user_handler then return user_handler(err, result, ctx2, config) end
-      end
+    if method == "textDocument/codeAction" then
+      wrapped = wrap_response(user_handler, function(result)
+        return remap_code_action_result(result, ctx, st)
+      end)
+    elseif method == "textDocument/rename" then
+      wrapped = wrap_response(user_handler, function(result)
+        return remap_workspace_edit_result(result, ctx)
+      end)
+    elseif in_fn then
+      wrapped = wrap_response(user_handler, function(result)
+        return in_fn(result, st)
+      end)
     end
     return orig_request(self, method, params, wrapped, bufnr)
   end
