@@ -859,6 +859,11 @@ function M.send_fake_change(client, bufnr, uri)
   })
 end
 
+local function find_header_includer(ctx, header_path, header_uri, force)
+  if ctx.find_includer then return ctx.find_includer(header_path, header_uri, force) end
+  return graph.find_includer(header_path, { force = force })
+end
+
 -- ====================================================================
 -- Per-client wrapping
 -- ====================================================================
@@ -934,7 +939,13 @@ function M.wrap_client(client, ctx)
       if td and td.uri then
         local path = uri_to_path(td.uri)
         if is_header_path(path) then
-          local includer = graph.find_includer(path)
+          if ctx.is_disabled and ctx.is_disabled(td.uri) then
+            local st = ctx.get_state_for_uri(td.uri)
+            if st and ctx.on_header_detached then ctx.on_header_detached(st) end
+            return params and orig_notify(self, method, params)
+          end
+          local force = ctx.consume_forced and ctx.consume_forced(td.uri) or false
+          local includer = find_header_includer(ctx, path, td.uri, force)
           if includer then
             local bn = vim.fn.bufnr(path)
             if bn > 0 then
@@ -975,7 +986,15 @@ function M.wrap_client(client, ctx)
           M.shift_did_change(params, st)
         end
         local path = uri_to_path(td.uri)
-        if is_tu_path(path) then graph.invalidate(path) end
+        if is_tu_path(path) then
+          local changes = params.contentChanges
+          local full_text_change = changes and #changes == 1 and not changes[1].range and type(changes[1].text) == "string"
+          if full_text_change then
+            graph.observe_tu(path, changes[1].text)
+          else
+            graph.invalidate(path)
+          end
+        end
       end
     elseif method == "textDocument/didClose" then
       local td = params and params.textDocument

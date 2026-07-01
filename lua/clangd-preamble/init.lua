@@ -6,7 +6,12 @@ local M = {}
 M._enabled = true
 M._buf_state = {}
 M._attached_clients = {}
+M._disabled_uris = {}
+M._forced_uris = {}
+M._preferred_includers = {}
+M._recent_includer_uris = {}
 M._autogroup = vim.api.nvim_create_augroup("ClangdPreamble", { clear = true })
+local last_active_tu_path = nil
 
 local function get_state_for_bufnr(bufnr) return M._buf_state[bufnr] end
 local function get_state_for_uri(uri)
@@ -16,6 +21,45 @@ local function get_state_for_uri(uri)
 end
 local function all_states() return M._buf_state end
 local function is_enabled() return M._enabled end
+local function is_disabled(uri) return M._disabled_uris[uri] == true end
+
+local function uri_for_bufnr(bufnr)
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" then return nil, nil end
+  return vim.uri_from_fname(path), path
+end
+
+local function mark_forced(uri) M._forced_uris[uri] = true end
+local function consume_forced(uri)
+  local forced = M._forced_uris[uri] == true
+  M._forced_uris[uri] = nil
+  return forced
+end
+
+local function clear_selection(uri)
+  M._preferred_includers[uri] = nil
+  M._recent_includer_uris[uri] = nil
+end
+
+local function mark_disabled(uri)
+  M._disabled_uris[uri] = true
+  M._forced_uris[uri] = nil
+  clear_selection(uri)
+end
+
+local function clear_disabled(uri) M._disabled_uris[uri] = nil end
+
+local function find_header_includer(path, uri, force)
+  local preferred = M._preferred_includers[uri]
+  if preferred then
+    return graph.find_includer(path, { force = true, preferred_tu = preferred })
+  end
+  if M._recent_includer_uris[uri] then
+    return graph.find_recent_includer(path, { force = true })
+        or graph.find_includer(path, { force = true })
+  end
+  return graph.find_includer(path, { force = force })
+end
 
 local function on_header_attached(st)
   M._buf_state[st.bufnr] = st
@@ -50,16 +94,18 @@ local function try_promote_pending(client)
        and not M._buf_state[bn] then
       local path = vim.api.nvim_buf_get_name(bn)
       if path ~= "" and lsp.is_header_path(path) then
-        local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
-        for _, c in ipairs(clients) do
-          if c.id == client.id then
-            local inc = graph.find_includer(path)
-            if inc then
-              local uri = vim.uri_from_fname(path)
-              reissue_open(c, bn, path, uri)
-              lsp.send_fake_change(c, bn, uri)
+        local uri = vim.uri_from_fname(path)
+        if not M._disabled_uris[uri] then
+          local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
+          for _, c in ipairs(clients) do
+            if c.id == client.id then
+              local inc = find_header_includer(path, uri, false)
+              if inc then
+                reissue_open(c, bn, path, uri)
+                lsp.send_fake_change(c, bn, uri)
+              end
+              break
             end
-            break
           end
         end
       end
@@ -87,10 +133,65 @@ local function try_refresh_existing(client, tu_path)
   end
 end
 
+local function observe_tu_buffer(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then return nil end
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" or not lsp.is_tu_path(path) then return nil end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local text = table.concat(lines, "\n") .. (vim.bo[bufnr].endofline and "\n" or "")
+  graph.observe_tu(path, text)
+  return path
+end
+
+local function reissue_recent_header_if_changed(bufnr)
+  local uri, path = uri_for_bufnr(bufnr)
+  if not uri or not path or not M._recent_includer_uris[uri] or M._disabled_uris[uri] then return false end
+  local recent = graph.find_recent_includer(path, { force = true })
+  if not recent then return false end
+  local st = M._buf_state[bufnr]
+  if st and st.includer_tu == recent.tu_path then return false end
+  local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bufnr })
+  if #clients == 0 then return false end
+  mark_forced(uri)
+  reissue_open(clients[1], bufnr, path, uri)
+  lsp.send_fake_change(clients[1], bufnr, uri)
+  return true
+end
+
+local function reissue_recent_headers_for_tu(tu_path)
+  for _, bn in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bn) and vim.api.nvim_buf_is_loaded(bn) then
+      local uri, path = uri_for_bufnr(bn)
+      if uri and path and lsp.is_header_path(path) and M._recent_includer_uris[uri] then
+        local recent = graph.find_recent_includer(path, { force = true })
+        if recent and recent.tu_path == tu_path then reissue_recent_header_if_changed(bn) end
+      end
+    end
+  end
+end
+
+local function handle_active_buffer_change(bufnr)
+  local last_bn = last_active_tu_path and vim.fn.bufnr(last_active_tu_path) or -1
+  local left_tu = last_bn > 0 and observe_tu_buffer(last_bn) or nil
+  last_active_tu_path = nil
+  if left_tu then reissue_recent_headers_for_tu(left_tu) end
+
+  local current_tu = observe_tu_buffer(bufnr)
+  if current_tu then
+    last_active_tu_path = current_tu
+    reissue_recent_headers_for_tu(current_tu)
+  elseif bufnr and bufnr ~= 0 then
+    reissue_recent_header_if_changed(bufnr)
+  end
+end
+
 CTX.is_enabled            = is_enabled
 CTX.get_state_for_bufnr   = get_state_for_bufnr
 CTX.get_state_for_uri     = get_state_for_uri
 CTX.all_states            = all_states
+CTX.is_disabled           = is_disabled
+CTX.consume_forced        = consume_forced
+CTX.find_includer         = find_header_includer
 CTX.on_header_attached    = on_header_attached
 CTX.on_header_detached    = on_header_detached
 -- Promotion can be heavy (disk I/O for every pending header), so defer it
@@ -114,6 +215,81 @@ function M.includer_for(bufnr)
   return st and st.includer_tu or nil
 end
 
+function M.selection_for(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local uri = uri_for_bufnr(bufnr)
+  if not uri then return "auto" end
+  if M._preferred_includers[uri] then return "fixed", M._preferred_includers[uri] end
+  if M._recent_includer_uris[uri] then return "recent" end
+  return "auto"
+end
+
+function M.is_disabled(bufnr)
+  local uri = uri_for_bufnr(bufnr or vim.api.nvim_get_current_buf())
+  return uri and M._disabled_uris[uri] == true or false
+end
+
+function M.list_includers(bufnr)
+  local _, path = uri_for_bufnr(bufnr or vim.api.nvim_get_current_buf())
+  if not path then return {} end
+  return graph.list_includers(path, { force = true })
+end
+
+local function reissue_selected_header(bufnr)
+  local uri, path = uri_for_bufnr(bufnr)
+  if not uri or not path or not lsp.is_header_path(path) then return false end
+  local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bufnr })
+  if #clients == 0 then return false end
+  mark_forced(uri)
+  reissue_open(clients[1], bufnr, path, uri)
+  lsp.send_fake_change(clients[1], bufnr, uri)
+  return true
+end
+
+local function active_header()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local uri, path = uri_for_bufnr(bufnr)
+  if not uri or not path or not lsp.is_header_path(path) then
+    vim.notify("clangd-preamble: current file is not a header", vim.log.levels.WARN)
+    return nil, nil, nil
+  end
+  return bufnr, uri, path
+end
+
+local function workspace_relative(path)
+  local cwd = vim.fn.getcwd()
+  local rel = vim.fn.fnamemodify(path, ":.")
+  if rel ~= path then return rel end
+  if path:sub(1, #cwd + 1) == cwd .. "/" then return path:sub(#cwd + 2) end
+  return path
+end
+
+function M.use_auto_includer(bufnr)
+  local uri = uri_for_bufnr(bufnr or vim.api.nvim_get_current_buf())
+  if not uri then return false end
+  clear_disabled(uri)
+  clear_selection(uri)
+  return reissue_selected_header(bufnr or vim.api.nvim_get_current_buf())
+end
+
+function M.use_recent_includer(bufnr)
+  local uri = uri_for_bufnr(bufnr or vim.api.nvim_get_current_buf())
+  if not uri then return false end
+  clear_disabled(uri)
+  M._recent_includer_uris[uri] = true
+  M._preferred_includers[uri] = nil
+  return reissue_selected_header(bufnr or vim.api.nvim_get_current_buf())
+end
+
+function M.use_includer(bufnr, tu_path)
+  local uri = uri_for_bufnr(bufnr or vim.api.nvim_get_current_buf())
+  if not uri or not tu_path then return false end
+  clear_disabled(uri)
+  M._preferred_includers[uri] = tu_path
+  M._recent_includer_uris[uri] = nil
+  return reissue_selected_header(bufnr or vim.api.nvim_get_current_buf())
+end
+
 function M.attach(client, bufnr)
   if client.name ~= "clangd" then return end
   lsp.install_handlers(get_state_for_uri, all_states)
@@ -131,18 +307,17 @@ function M.attach(client, bufnr)
     if lsp.is_header_path(path) then
       reissue_open(client, bufnr, path, uri)
     elseif lsp.is_tu_path(path) then
-      graph.observe_tu_from_disk(path)
+      observe_tu_buffer(bufnr)
     end
   end
 end
 
-local function force_reopen_header(st)
-  local clients = vim.lsp.get_clients({ name = "clangd", bufnr = st.bufnr })
-  if #clients == 0 then return end
-  M._buf_state[st.bufnr] = nil
-  lsp.clear_semtok(st.bufnr)
-  reissue_open(clients[1], st.bufnr, st.header_path, st.header_uri)
-end
+vim.api.nvim_create_autocmd({ "BufEnter", "BufLeave" }, {
+  group = M._autogroup,
+  callback = function(args)
+    if M._enabled then handle_active_buffer_change(args.buf) end
+  end,
+})
 
 vim.api.nvim_create_autocmd("LspDetach", {
   group = M._autogroup,
@@ -193,50 +368,120 @@ vim.api.nvim_create_user_command("NoSelfContainedEnable", function()
 end, {})
 
 vim.api.nvim_create_user_command("NoSelfContainedDisableBuf", function()
-  local bn = vim.api.nvim_get_current_buf()
-  local st = M._buf_state[bn]
-  if not st then
-    vim.notify("clangd-preamble: no state for current buffer", vim.log.levels.WARN)
-    return
-  end
-  st.active = false
-  force_reopen_header(st)
-  M._buf_state[bn] = nil
-end, {})
-
-vim.api.nvim_create_user_command("NoSelfContainedEnableBuf", function()
-  local bn = vim.api.nvim_get_current_buf()
-  local path = vim.api.nvim_buf_get_name(bn)
-  local includer = graph.find_includer(path, true)
-  if not includer then
-    vim.notify("clangd-preamble: no includer found for " .. path, vim.log.levels.WARN)
-    return
-  end
+  local bn, uri, path = active_header()
+  if not bn then return end
   local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
   if #clients == 0 then
     vim.notify("clangd-preamble: no clangd client attached", vim.log.levels.WARN)
     return
   end
-  local cli = clients[1]
-  local uri = vim.uri_from_fname(path)
-  cli:notify("textDocument/didClose", { textDocument = { uri = uri } })
-  local st = lsp.build_state(bn, uri, path, includer)
-  on_header_attached(st)
-  local lines = vim.api.nvim_buf_get_lines(bn, 0, -1, false)
-  cli:notify("textDocument/didOpen", {
-    textDocument = {
-      uri = uri,
-      languageId = vim.bo[bn].filetype,
-      version = vim.lsp.util.buf_versions[bn] or 0,
-      text = table.concat(lines, "\n") .. (vim.bo[bn].endofline and "\n" or ""),
+  mark_disabled(uri)
+  local st = M._buf_state[bn]
+  if st then on_header_detached(st) end
+  reissue_open(clients[1], bn, path, uri)
+  vim.notify("clangd-preamble: disabled for current file", vim.log.levels.INFO)
+end, {})
+
+vim.api.nvim_create_user_command("NoSelfContainedEnableBuf", function()
+  local bn, uri = active_header()
+  if not bn then return end
+  clear_disabled(uri)
+  mark_forced(uri)
+  if reissue_selected_header(bn) then
+    local st = M._buf_state[bn]
+    if st then
+      vim.notify(("clangd-preamble: enabled (TU=%s, %d preamble lines)"):format(
+        vim.fn.fnamemodify(st.includer_tu, ":t"), st.preamble_lines), vim.log.levels.INFO)
+    end
+  else
+    vim.notify("clangd-preamble: no clangd client attached", vim.log.levels.WARN)
+  end
+end, {})
+
+vim.api.nvim_create_user_command("NoSelfContainedSelectIncluder", function()
+  local bn, uri, path = active_header()
+  if not bn then return end
+  local candidates = graph.list_includers(path, { force = true })
+  if #candidates == 0 then
+    vim.notify("clangd-preamble: no includer candidates found for current file", vim.log.levels.WARN)
+    return
+  end
+
+  local mode, preferred = M.selection_for(bn)
+  local current = M.includer_for(bn)
+  local auto = graph.find_includer(path, { force = true })
+  local recent = graph.find_recent_includer(path, { force = true })
+  local items = {
+    {
+      kind = "auto",
+      label = ("%sAuto-select best includer%s"):format(
+        mode == "auto" and "* " or "  ",
+        auto and (" (" .. workspace_relative(auto.tu_path) .. ")") or ""),
     },
-  })
+    {
+      kind = "recent",
+      label = ("%sUse last seen includer%s"):format(
+        mode == "recent" and "* " or "  ",
+        recent and (" (" .. workspace_relative(recent.tu_path) .. ")") or ""),
+    },
+  }
+
+  for _, c in ipairs(candidates) do
+    local suffix = c.tu_path == current and ", current" or ""
+    table.insert(items, {
+      kind = "fixed",
+      tu_path = c.tu_path,
+      label = ("%s%s - %d preamble line(s), include #%d, direct=%s%s%s"):format(
+        preferred == c.tu_path and "* " or "  ",
+        workspace_relative(c.tu_path),
+        #c.prefix_lines,
+        c.include_index + 1,
+        tostring(c.direct),
+        c.companion and ", companion" or "",
+        suffix),
+    })
+  end
+
+  vim.ui.select(items, {
+    prompt = "Select preamble source translation unit",
+    format_item = function(item) return item.label end,
+  }, function(item)
+    if not item then return end
+    local ok = false
+    if item.kind == "auto" then
+      ok = M.use_auto_includer(bn)
+    elseif item.kind == "recent" then
+      ok = M.use_recent_includer(bn)
+    elseif item.tu_path then
+      ok = M.use_includer(bn, item.tu_path)
+    end
+    if not ok then
+      vim.notify("clangd-preamble: no clangd client attached", vim.log.levels.WARN)
+      return
+    end
+    local st = M._buf_state[bn]
+    if st then
+      vim.notify(("clangd-preamble: using %s (%d preamble lines)"):format(
+        vim.fn.fnamemodify(st.includer_tu, ":t"), st.preamble_lines), vim.log.levels.INFO)
+    end
+  end)
 end, {})
 
 vim.api.nvim_create_user_command("NoSelfContainedStatus", function()
   local bn = vim.api.nvim_get_current_buf()
+  local uri, path = uri_for_bufnr(bn)
   local st = M._buf_state[bn]
   local lines = { ("global enabled: %s"):format(tostring(M._enabled)) }
+  if path and lsp.is_header_path(path) then
+    local mode, preferred = M.selection_for(bn)
+    table.insert(lines, ("buffer disabled: %s"):format(tostring(uri and M._disabled_uris[uri] == true)))
+    if mode == "fixed" then
+      table.insert(lines, ("selection: fixed (%s)"):format(preferred))
+    else
+      table.insert(lines, ("selection: %s"):format(mode == "recent" and "last seen" or "auto"))
+    end
+    table.insert(lines, ("includer candidates: %d"):format(#graph.list_includers(path, { force = true })))
+  end
   if st then
     table.insert(lines, ("buffer %d  active=%s  preamble_lines=%d  stale=%s"):format(
       bn, tostring(st.active), st.preamble_lines, tostring(st.includer_stale)))
@@ -252,37 +497,23 @@ vim.api.nvim_create_user_command("NoSelfContainedStatus", function()
 end, {})
 
 vim.api.nvim_create_user_command("NoSelfContainedRefresh", function()
-  local bn = vim.api.nvim_get_current_buf()
-  local path = vim.api.nvim_buf_get_name(bn)
-  if not lsp.is_header_path(path) then
-    vim.notify("clangd-preamble: not a header", vim.log.levels.WARN)
-    return
-  end
+  local bn, uri = active_header()
+  if not bn then return end
   local existing = M._buf_state[bn]
   if existing then graph.invalidate(existing.includer_tu) end
-  local includer = graph.find_includer(path, true)
-  if not includer then
-    vim.notify("clangd-preamble: no includer found", vim.log.levels.WARN)
+  clear_disabled(uri)
+  mark_forced(uri)
+  if not reissue_selected_header(bn) then
+    vim.notify("clangd-preamble: no clangd client attached", vim.log.levels.WARN)
     return
   end
-  local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
-  if #clients == 0 then return end
-  local cli = clients[1]
-  local uri = vim.uri_from_fname(path)
-  cli:notify("textDocument/didClose", { textDocument = { uri = uri } })
-  local st = lsp.build_state(bn, uri, path, includer)
-  on_header_attached(st)
-  local lines = vim.api.nvim_buf_get_lines(bn, 0, -1, false)
-  cli:notify("textDocument/didOpen", {
-    textDocument = {
-      uri = uri,
-      languageId = vim.bo[bn].filetype,
-      version = vim.lsp.util.buf_versions[bn] or 0,
-      text = table.concat(lines, "\n") .. (vim.bo[bn].endofline and "\n" or ""),
-    },
-  })
-  vim.notify(("clangd-preamble: refreshed (TU=%s, %d preamble lines)"):format(
-    includer.tu_path, st.preamble_lines), vim.log.levels.INFO)
+  local st = M._buf_state[bn]
+  if st then
+    vim.notify(("clangd-preamble: refreshed (TU=%s, %d preamble lines)"):format(
+      vim.fn.fnamemodify(st.includer_tu, ":t"), st.preamble_lines), vim.log.levels.INFO)
+  else
+    vim.notify("clangd-preamble: no includer found", vim.log.levels.WARN)
+  end
 end, {})
 
 vim.api.nvim_create_user_command("NoSelfContainedDumpGraph", function()

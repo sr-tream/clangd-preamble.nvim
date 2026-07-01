@@ -95,10 +95,11 @@ table.insert(opts.sections.lualine_x, 1, { clangd_preamble, color = { fg = "#7aa
 | Command | Action |
 |---|---|
 | `:NoSelfContainedDisable` / `:NoSelfContainedEnable` | Global on/off — when off, traffic passes through unchanged |
-| `:NoSelfContainedDisableBuf` | Strip preamble for the current buffer; force a clean re-open |
-| `:NoSelfContainedEnableBuf` | Force preamble injection (bypasses the self-contained heuristic) |
+| `:NoSelfContainedDisableBuf` | Disable synthetic preamble for the current header until re-enabled |
+| `:NoSelfContainedEnableBuf` | Re-enable preamble injection for the current header |
+| `:NoSelfContainedSelectIncluder` | Choose auto, last-seen, or a fixed includer TU for the current header |
 | `:NoSelfContainedRefresh` | Re-pick the includer TU, re-build the preamble, replay didOpen |
-| `:NoSelfContainedStatus` | Print state for the current buffer (preamble, includer TU, line count) |
+| `:NoSelfContainedStatus` | Print state for the current buffer (selection, preamble, includer TU, line count) |
 | `:NoSelfContainedDumpGraph` | Dump the observed TU/header graph |
 | `:NoSelfContainedDumpDiagnostics` | Dump diagnostics suppressed because they fell in the preamble |
 | `:NoSelfContainedScanProject` | Walk `cwd` for `.cpp/.cc/...` files, observe their includes — useful when no TU has been opened yet |
@@ -110,10 +111,9 @@ table.insert(opts.sections.lualine_x, 1, { clangd_preamble, color = { fg = "#7aa
    graph indexed by basename.
 2. **Includer pick.** When the user opens a header, the graph is queried for
    the TU with the **shortest prefix-before-this-header** (tie-break: most
-   recent observation). Polluting includers (CEF wrappers, framework files
-   that put `common.h` after several other headers) are deprioritized.
-   Companion-TU fallback (`Foo.cpp` next to `Foo.h`) covers the
-   header-opened-alone case.
+   recent observation). `:NoSelfContainedSelectIncluder` can pin a specific
+   TU or switch the header to the most recently observed includer. Companion-TU
+   fallback (`Foo.cpp` next to `Foo.h`) covers the header-opened-alone case.
 3. **Self-contained skip.** Headers with **3 or more own `#include`
    directives** are likely self-contained and skipped automatically — the
    preamble can only introduce conflicts in that case. Manual commands

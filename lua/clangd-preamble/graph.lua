@@ -11,6 +11,8 @@ M.header_users = {}
 M.tu_mtime     = {}
 M._path_cache  = {}
 local lru_seq = 0
+local build_prefix
+local header_is_self_contained
 
 local function parse_text(text)
   local out = {}
@@ -71,35 +73,120 @@ local function companion_tu(header_path)
 end
 M.companion_tu = companion_tu
 
-local function pick_includer_tu(header_path)
+local function observed_candidate_tus(header_path)
   local basename = basename_of(header_path)
   local candidates = M.header_users[basename]
-  if candidates and #candidates > 0 then
-    -- Prefer the TU with the shortest prefix-before-this-header. A polluting
-    -- TU (e.g. CEF wrapper that puts common.h after several framework headers)
-    -- would inject macros that conflict with the header's own includes — pick
-    -- the most "neutral" includer instead. Tie-break: most recent observation.
-    local best, best_pos, best_mt = nil, math.huge, -1
-    for _, tu in ipairs(candidates) do
-      local tu_inc = M.tu_includes[tu]
-      if tu_inc then
-        local pos = #tu_inc
-        for i, e in ipairs(tu_inc) do
-          if basename_of(e.name) == basename then pos = i - 1; break end
-        end
-        local mt = M.tu_mtime[tu] or 0
-        if pos < best_pos or (pos == best_pos and mt > best_mt) then
-          best, best_pos, best_mt = tu, pos, mt
-        end
-      end
-    end
-    if best then return best end
+  local out = {}
+  if not candidates then return out end
+  for _, tu in ipairs(candidates) do
+    if M.tu_includes[tu] then table.insert(out, tu) end
   end
+  return out
+end
+
+local function include_index(tu_path, header_basename)
+  local tu_inc = M.tu_includes[tu_path]
+  if not tu_inc then return math.huge end
+  for i, e in ipairs(tu_inc) do
+    if basename_of(e.name) == header_basename then return i - 1 end
+  end
+  return #tu_inc
+end
+
+local function project_root_for_tu(tu_path)
+  local root = vim.fs.dirname(tu_path) or vim.fn.getcwd()
+  for _ = 1, 5 do
+    local up = vim.fs.dirname(root)
+    if not up or up == root then break end
+    if vim.uv.fs_stat(root .. "/.git") or vim.uv.fs_stat(root .. "/compile_commands.json") then break end
+    root = up
+  end
+  return root
+end
+
+local function candidate_from_tu(tu_path, header_path, companion)
+  local header_basename = basename_of(header_path)
+  local lines, direct = build_prefix(tu_path, header_basename, project_root_for_tu(tu_path))
+  if not lines or #lines == 0 then return nil end
+  return {
+    tu_path = tu_path,
+    prefix_lines = lines,
+    direct = direct,
+    include_index = include_index(tu_path, header_basename),
+    observed_order = M.tu_mtime[tu_path] or 0,
+    companion = companion,
+  }
+end
+
+local function sort_candidates(candidates)
+  table.sort(candidates, function(a, b)
+    if a.include_index ~= b.include_index then return a.include_index < b.include_index end
+    if a.observed_order ~= b.observed_order then return a.observed_order > b.observed_order end
+    return a.tu_path < b.tu_path
+  end)
+  return candidates
+end
+
+local function companion_candidate(header_path)
   local comp = companion_tu(header_path)
-  if comp and M.observe_tu_from_disk(comp) then
-    return comp
+  if not comp then return nil end
+  if not M.tu_includes[comp] and not M.observe_tu_from_disk(comp) then return nil end
+  return candidate_from_tu(comp, header_path, true)
+end
+
+local function observed_candidates(header_path)
+  local out = {}
+  for _, tu in ipairs(observed_candidate_tus(header_path)) do
+    local candidate = candidate_from_tu(tu, header_path, false)
+    if candidate then table.insert(out, candidate) end
   end
-  return nil
+  return sort_candidates(out)
+end
+
+local function normalize_find_options(options)
+  if type(options) == "table" then return options end
+  return { force = options == true }
+end
+
+-- Manual commands pass { force = true } to bypass the self-contained heuristic.
+function M.find_includer(header_path, options)
+  options = normalize_find_options(options)
+  if not options.force and header_is_self_contained(header_path) then return nil end
+  if options.preferred_tu then
+    for _, candidate in ipairs(M.list_includers(header_path, { force = true })) do
+      if candidate.tu_path == options.preferred_tu then return candidate end
+    end
+  end
+  local observed = observed_candidates(header_path)
+  if #observed > 0 then return observed[1] end
+  return companion_candidate(header_path)
+end
+
+function M.find_recent_includer(header_path, options)
+  options = normalize_find_options(options)
+  if not options.force and header_is_self_contained(header_path) then return nil end
+  local observed = observed_candidates(header_path)
+  table.sort(observed, function(a, b)
+    if a.observed_order ~= b.observed_order then return a.observed_order > b.observed_order end
+    if a.include_index ~= b.include_index then return a.include_index < b.include_index end
+    return a.tu_path < b.tu_path
+  end)
+  return observed[1]
+end
+
+function M.list_includers(header_path, options)
+  options = normalize_find_options(options)
+  if not options.force and header_is_self_contained(header_path) then return {} end
+  local out = observed_candidates(header_path)
+  local comp = companion_candidate(header_path)
+  if comp then
+    local seen = false
+    for _, candidate in ipairs(out) do
+      if candidate.tu_path == comp.tu_path then seen = true; break end
+    end
+    if not seen then table.insert(out, comp) end
+  end
+  return sort_candidates(out)
 end
 
 local function find_header_path(basename, root)
@@ -140,7 +227,7 @@ local function transitively_includes(start_bn, target_bn, root, depth, seen)
   return false
 end
 
-local function build_prefix(tu_path, header_basename, root)
+build_prefix = function(tu_path, header_basename, root)
   local tu_inc = M.tu_includes[tu_path]
   if not tu_inc then return nil, false end
   local cut = nil
@@ -171,7 +258,7 @@ end
 -- transitive context — they need the preamble.
 local SELF_CONTAINED_INCLUDE_THRESHOLD = 3
 
-local function header_is_self_contained(path)
+header_is_self_contained = function(path)
   local f = io.open(path, "r")
   if not f then return true end
   local count = 0
@@ -183,23 +270,6 @@ local function header_is_self_contained(path)
   end
   f:close()
   return false
-end
-
--- Manual commands pass force=true to bypass the self-contained heuristic.
-function M.find_includer(header_path, force)
-  if not force and header_is_self_contained(header_path) then return nil end
-  local tu = pick_includer_tu(header_path)
-  if not tu then return nil end
-  local root = vim.fs.dirname(tu) or vim.fn.getcwd()
-  for _ = 1, 5 do
-    local up = vim.fs.dirname(root)
-    if not up or up == root then break end
-    if vim.uv.fs_stat(root .. "/.git") or vim.uv.fs_stat(root .. "/compile_commands.json") then break end
-    root = up
-  end
-  local lines, direct = build_prefix(tu, basename_of(header_path), root)
-  if not lines or #lines == 0 then return nil end
-  return { tu_path = tu, prefix_lines = lines, direct = direct }
 end
 
 function M.scan_project_for_includers(root)

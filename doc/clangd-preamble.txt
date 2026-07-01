@@ -88,9 +88,14 @@ require("clangd-preamble").includer_for([{bufnr}])
                                                      *:NoSelfContainedEnableBuf*
 :NoSelfContainedDisableBuf
 :NoSelfContainedEnableBuf
-  Per-buffer override. Disable strips the preamble and forces a clean re-open
-  for the current buffer. Enable forces preamble injection even on headers
-  the self-contained heuristic would otherwise skip.
+  Per-buffer override. Disable sends the current header to clangd without a
+  synthetic preamble until it is re-enabled. Enable forces preamble injection
+  even on headers the self-contained heuristic would otherwise skip.
+
+                                                *:NoSelfContainedSelectIncluder*
+:NoSelfContainedSelectIncluder
+  Choose the current header's preamble source: auto-select, use the last seen
+  includer TU, or pin a specific observed includer TU.
 
                                                        *:NoSelfContainedRefresh*
 :NoSelfContainedRefresh
@@ -119,7 +124,8 @@ require("clangd-preamble").includer_for([{bufnr}])
 
   1. Outgoing didOpen for TUs is intercepted; #includes parsed into a graph.
   2. Header didOpen queries the graph for the TU with the shortest
-     prefix-before-this-header (tie-break: most recent). Companion TU
+     prefix-before-this-header (tie-break: most recent). Headers can also pin
+     a specific includer TU or use the last seen includer TU. Companion TU
      (Foo.cpp next to Foo.h) is the fallback.
   3. Headers with >= 3 own #include directives are auto-skipped (likely
      self-contained). Manual commands override via force=true.
