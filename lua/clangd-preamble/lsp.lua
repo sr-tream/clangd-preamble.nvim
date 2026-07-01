@@ -957,7 +957,13 @@ function M.wrap_client(client, ctx)
           local already_open = M.promote_virtual_tu(path)
           graph.observe_tu(path, td.text)
           if ctx.on_tu_observed then ctx.on_tu_observed(self, path) end
-          if already_open then return end
+          if already_open then
+            orig_notify(self, "textDocument/didChange", {
+              textDocument = { uri = td.uri, version = td.version or 0 },
+              contentChanges = { { text = td.text } },
+            })
+            return
+          end
         end
       end
     elseif method == "textDocument/didChange" then
