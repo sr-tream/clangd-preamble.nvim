@@ -10,9 +10,12 @@ M._disabled_uris = {}
 M._forced_uris = {}
 M._preferred_includers = {}
 M._recent_includer_uris = {}
-M._config = { default_selector = "preamble_size" }
+M._config = { default_selector = "preamble_size", graph_cache = true }
 M._autogroup = vim.api.nvim_create_augroup("ClangdPreamble", { clear = true })
 local last_active_tu_path = nil
+local graph_cache_restored_for = nil
+local graph_cache_save_pending = false
+local buf_paths = {}
 
 local function normalize_default_selector(value)
   if value == "last_seen" or value == "lastSeen" or value == "recent" then
@@ -24,6 +27,77 @@ end
 local function default_selector_label()
   return M._config.default_selector == "last_seen" and "last seen" or "preamble size"
 end
+
+local function graph_cache_enabled()
+  return M._config.graph_cache ~= false
+end
+
+local function graph_cache_dir()
+  return vim.fn.stdpath("cache") .. "/clangd-preamble"
+end
+
+local function graph_cache_path()
+  local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
+  return graph_cache_dir() .. "/graph-" .. vim.fn.sha256(cwd) .. ".json"
+end
+
+local function json_encode(value)
+  if vim.json and vim.json.encode then return vim.json.encode(value) end
+  return vim.fn.json_encode(value)
+end
+
+local function json_decode(text)
+  if vim.json and vim.json.decode then return vim.json.decode(text) end
+  return vim.fn.json_decode(text)
+end
+
+local function save_graph_cache_now()
+  if not graph_cache_enabled() then return end
+  local ok_mkdir = pcall(vim.fn.mkdir, graph_cache_dir(), "p")
+  if not ok_mkdir then return end
+  local ok_json, text = pcall(json_encode, graph.snapshot())
+  if not ok_json or type(text) ~= "string" then return end
+  local f = io.open(graph_cache_path(), "w")
+  if not f then return end
+  f:write(text)
+  f:close()
+end
+
+local function schedule_graph_cache_save(delay_ms)
+  if not graph_cache_enabled() or graph_cache_save_pending then return end
+  graph_cache_save_pending = true
+  vim.defer_fn(function()
+    graph_cache_save_pending = false
+    save_graph_cache_now()
+  end, delay_ms or 1000)
+end
+
+local function restore_graph_cache()
+  local path = graph_cache_path()
+  if graph_cache_restored_for == path or not graph_cache_enabled() then return end
+  graph_cache_restored_for = path
+  local f = io.open(path, "r")
+  if not f then return end
+  local text = f:read("*a")
+  f:close()
+  local ok, snapshot = pcall(json_decode, text)
+  if not ok then
+    os.remove(path)
+    return
+  end
+  local result = graph.restore_snapshot(snapshot)
+  if result.unsupported then
+    os.remove(path)
+  elseif result.dropped and result.dropped > 0 then
+    schedule_graph_cache_save(5000)
+  end
+end
+
+local function ensure_graph_cache_restored()
+  if graph_cache_enabled() then restore_graph_cache() end
+end
+
+graph.on_change(function() schedule_graph_cache_save() end)
 
 local function get_state_for_bufnr(bufnr) return M._buf_state[bufnr] end
 local function get_state_for_uri(uri)
@@ -134,6 +208,15 @@ local function try_promote_pending(client)
   end
 end
 
+local function try_promote_pending_for_attached_clients()
+  for id, attached in pairs(M._attached_clients) do
+    if attached then
+      local client = vim.lsp.get_client_by_id(id)
+      if client and client.name == "clangd" then try_promote_pending(client) end
+    end
+  end
+end
+
 -- Re-issue didOpen for headers that already have state but whose includer
 -- just became live in clangd (editor open). The companion-from-disk path
 -- builds the preamble before clangd has a PCH for the TU, leaving residual
@@ -164,6 +247,20 @@ local function observe_tu_buffer(bufnr)
   return path
 end
 
+local function observe_tu_from_current_source(path)
+  if not path or path == "" or not lsp.is_tu_path(path) then return nil end
+  local bufnr = vim.fn.bufnr(path)
+  local observed
+  if bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr) then
+    observed = observe_tu_buffer(bufnr)
+  else
+    graph.invalidate(path)
+    if graph.observe_tu_from_disk(path) then observed = path end
+  end
+  if observed then try_promote_pending_for_attached_clients() end
+  return observed
+end
+
 local function reissue_recent_header_if_changed(bufnr)
   local uri, path = uri_for_bufnr(bufnr)
   if not uri or not path or M._disabled_uris[uri] or not uses_recent_selector(uri) then return false end
@@ -192,6 +289,7 @@ local function reissue_recent_headers_for_tu(tu_path)
 end
 
 local function handle_active_buffer_change(bufnr)
+  ensure_graph_cache_restored()
   local last_bn = last_active_tu_path and vim.fn.bufnr(last_active_tu_path) or -1
   local left_tu = last_bn > 0 and observe_tu_buffer(last_bn) or nil
   last_active_tu_path = nil
@@ -203,6 +301,29 @@ local function handle_active_buffer_change(bufnr)
     reissue_recent_headers_for_tu(current_tu)
   elseif bufnr and bufnr ~= 0 then
     reissue_recent_header_if_changed(bufnr)
+  end
+end
+
+local function current_buf_path(bufnr)
+  if not bufnr or bufnr == 0 or not vim.api.nvim_buf_is_valid(bufnr) then return nil end
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" then return nil end
+  return path
+end
+
+local function remember_buf_path(bufnr)
+  local path = current_buf_path(bufnr)
+  if path then buf_paths[bufnr] = path end
+  return path
+end
+
+local function refresh_or_invalidate_path(path)
+  if not path or path == "" then return end
+  ensure_graph_cache_restored()
+  if lsp.is_tu_path(path) then
+    observe_tu_from_current_source(path)
+  elseif lsp.is_header_path(path) then
+    graph.invalidate(path)
   end
 end
 
@@ -236,6 +357,10 @@ function M.setup(opts)
   if opts.default_selector ~= nil then
     M._config.default_selector = normalize_default_selector(opts.default_selector)
   end
+  if opts.graph_cache ~= nil then
+    M._config.graph_cache = opts.graph_cache ~= false
+  end
+  ensure_graph_cache_restored()
 end
 
 function M.default_selector()
@@ -324,6 +449,7 @@ end
 
 function M.attach(client, bufnr)
   if client.name ~= "clangd" then return end
+  ensure_graph_cache_restored()
   lsp.install_handlers(get_state_for_uri, all_states)
   if M._attached_clients[client.id] then return end
   M._attached_clients[client.id] = true
@@ -347,8 +473,32 @@ end
 vim.api.nvim_create_autocmd({ "BufEnter", "BufLeave" }, {
   group = M._autogroup,
   callback = function(args)
+    remember_buf_path(args.buf)
     if M._enabled then handle_active_buffer_change(args.buf) end
   end,
+})
+
+vim.api.nvim_create_autocmd({ "BufWritePost", "FileChangedShellPost" }, {
+  group = M._autogroup,
+  callback = function(args)
+    local path = remember_buf_path(args.buf)
+    refresh_or_invalidate_path(path)
+  end,
+})
+
+vim.api.nvim_create_autocmd("BufFilePost", {
+  group = M._autogroup,
+  callback = function(args)
+    local old_path = buf_paths[args.buf]
+    local new_path = remember_buf_path(args.buf)
+    if old_path and old_path ~= new_path then graph.invalidate(old_path) end
+    refresh_or_invalidate_path(new_path)
+  end,
+})
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  group = M._autogroup,
+  callback = function() save_graph_cache_now() end,
 })
 
 vim.api.nvim_create_autocmd("LspDetach", {
@@ -368,6 +518,7 @@ vim.api.nvim_create_autocmd("LspDetach", {
 vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
   group = M._autogroup,
   callback = function(args)
+    buf_paths[args.buf] = nil
     local st = M._buf_state[args.buf]
     if st then
       M._buf_state[args.buf] = nil
@@ -535,7 +686,7 @@ vim.api.nvim_create_user_command("NoSelfContainedRefresh", function()
   local bn, uri = active_header()
   if not bn then return end
   local existing = M._buf_state[bn]
-  if existing then graph.invalidate(existing.includer_tu) end
+  if existing then observe_tu_from_current_source(existing.includer_tu) end
   clear_disabled(uri)
   mark_forced(uri)
   if not reissue_selected_header(bn) then
@@ -567,8 +718,10 @@ vim.api.nvim_create_user_command("NoSelfContainedDumpDiagnostics", function()
 end, {})
 
 vim.api.nvim_create_user_command("NoSelfContainedScanProject", function()
+  ensure_graph_cache_restored()
   local root = vim.fn.getcwd()
   local n = graph.scan_project_for_includers(root)
+  try_promote_pending_for_attached_clients()
   vim.notify(("clangd-preamble: scanned %d TUs under %s"):format(n, root), vim.log.levels.INFO)
 end, {})
 

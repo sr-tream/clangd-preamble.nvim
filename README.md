@@ -82,6 +82,10 @@ require("clangd-preamble").setup({
   -- smallest include prefix before the header. "last_seen" follows the most
   -- recently observed includer TU instead.
   default_selector = "preamble_size",
+
+  -- Persist observed/project-scanned TU include graphs under stdpath("cache")
+  -- and restore entries whose file size and mtime still match.
+  graph_cache = true,
 })
 ```
 
@@ -113,7 +117,7 @@ table.insert(opts.sections.lualine_x, 1, { clangd_preamble, color = { fg = "#7aa
 | `:NoSelfContainedStatus` | Print state for the current buffer (selection, preamble, includer TU, line count) |
 | `:NoSelfContainedDumpGraph` | Dump the observed TU/header graph |
 | `:NoSelfContainedDumpDiagnostics` | Dump diagnostics suppressed because they fell in the preamble |
-| `:NoSelfContainedScanProject` | Walk `cwd` for `.cpp/.cc/...` files, observe their includes — useful when no TU has been opened yet |
+| `:NoSelfContainedScanProject` | Walk `cwd` for `.cpp/.cc/...` files and observe their includes; the graph is cached for later sessions |
 
 ## How it works
 
@@ -156,12 +160,17 @@ table.insert(opts.sections.lualine_x, 1, { clangd_preamble, color = { fg = "#7aa
    replayed via the wrapped notify so the preamble injection runs against
    the saved text. Promotion runs via `vim.schedule` to keep the wrapped
    notify path responsive on large projects.
+10. **Graph cache.** Observed and project-scanned TU include entries are stored
+    under `stdpath("cache")/clangd-preamble`, keyed by `cwd`. On restore, each
+    cached TU is accepted only if its file size and mtime still match. Buffer
+    write, file-change, and rename events refresh or invalidate affected TU and
+    header entries.
 
 ## Caveats
 
-- Header-opened-alone with no companion `.cpp` and no observed TU yields a
-  pass-through (no preamble) until either an includer TU's `didOpen` is
-  observed or `:NoSelfContainedScanProject` is run.
+- Header-opened-alone with no companion `.cpp` and no observed/restored TU
+  yields a pass-through (no preamble) until either an includer TU's `didOpen`
+  is observed or `:NoSelfContainedScanProject` is run.
 - Pull-diagnostics (`textDocument/diagnostic`) is not yet handled; rely on
   push (`publishDiagnostics`) for now.
 - Headers in two distinct buffers via different paths to the same file are

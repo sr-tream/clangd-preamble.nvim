@@ -63,6 +63,8 @@ Optional setup: >lua
     -- "preamble_size" picks the includer with the smallest include prefix.
     -- "last_seen" follows the most recently observed includer TU.
     default_selector = "preamble_size",
+    -- Persist observed/project-scanned TU include graphs under stdpath("cache").
+    graph_cache = true,
   })
 <
 
@@ -78,6 +80,12 @@ require("clangd-preamble").setup({opts})
       "preamble_size" (default) chooses the includer TU with the smallest
       include prefix before the header. "last_seen" chooses the most recently
       observed includer TU that can include the header.
+
+    graph_cache ~
+      true by default. Persist observed and project-scanned TU include graphs
+      under stdpath("cache")/clangd-preamble, keyed by the current working
+      directory. Cached entries are restored only when file size and mtime
+      still match. Set to false to keep the graph memory-only.
 
                                                   *clangd-preamble.attach()*
 require("clangd-preamble").attach({client}, {bufnr})
@@ -141,7 +149,8 @@ require("clangd-preamble").default_selector()
                                                   *:NoSelfContainedScanProject*
 :NoSelfContainedScanProject
   Walk the current working directory for `.cpp/.cc/...` files and observe
-  their includes. Useful when no TU has been opened yet.
+  their includes. The graph is cached for later sessions. Useful when no TU
+  has been opened yet.
 
 ==============================================================================
 6. How it works                                      *clangd-preamble-internals*
@@ -166,12 +175,16 @@ require("clangd-preamble").default_selector()
   9. Pending-header replay: a header opened before any TU is observed gets
      its original didOpen stashed; when a TU later populates the graph with
      a basename match, the stored open is replayed.
+ 10. Graph cache: observed and project-scanned TU entries are stored under
+     stdpath("cache")/clangd-preamble and restored only when file size and
+     mtime still match. Buffer write, file-change, and rename events refresh
+     or invalidate affected TU/header entries.
 
 ==============================================================================
 7. Caveats                                              *clangd-preamble-caveats*
 
-  - Header opened alone with no companion .cpp and no observed TU passes
-    through (no preamble) until either a TU is observed or
+  - Header opened alone with no companion .cpp and no observed/restored TU
+    passes through (no preamble) until either a TU is observed or
     :NoSelfContainedScanProject is run.
   - Pull-diagnostics (`textDocument/diagnostic`) is not yet handled; rely on
     push for now.

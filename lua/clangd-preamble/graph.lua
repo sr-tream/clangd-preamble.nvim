@@ -5,12 +5,20 @@ local MAX_PREAMBLE_LINES = 1500
 local MAX_PREAMBLE_BYTES = 64 * 1024
 local PROJECT_SCAN_LIMIT = 2000
 local CYCLE_CHECK_DEPTH = 1
+local HEADER_EXTS = {
+  h = true, hh = true, hpp = true, hxx = true,
+  inl = true, inc = true, ipp = true, tcc = true, tpp = true,
+}
+local TU_EXTS = {
+  cpp = true, cc = true, cxx = true, c = true, C = true, mm = true,
+}
 
 M.tu_includes  = {}
 M.header_users = {}
 M.tu_mtime     = {}
 M._path_cache  = {}
 local lru_seq = 0
+local change_listeners = {}
 local build_prefix
 local header_is_self_contained
 
@@ -31,7 +39,63 @@ local function basename_of(path)
   return path:match("([^/\\]+)$") or path
 end
 
-local function record_users(tu_path, incs)
+local function ext_of(path)
+  return basename_of(path):match("%.([^.]+)$") or ""
+end
+
+local function is_tu_path(path)
+  return TU_EXTS[ext_of(path)] == true
+end
+
+local function is_header_path(path)
+  return HEADER_EXTS[ext_of(path)] == true
+end
+
+local function emit_change()
+  for _, cb in ipairs(change_listeners) do pcall(cb) end
+end
+
+function M.on_change(cb)
+  table.insert(change_listeners, cb)
+  local active = true
+  return {
+    dispose = function()
+      if not active then return end
+      active = false
+      for i, listener in ipairs(change_listeners) do
+        if listener == cb then table.remove(change_listeners, i); break end
+      end
+    end,
+  }
+end
+
+local function clone_includes(incs)
+  local out = {}
+  for _, e in ipairs(incs or {}) do
+    table.insert(out, { name = e.name, kind = e.kind, line = e.line, raw = e.raw })
+  end
+  return out
+end
+
+local function unindex_tu(tu_path)
+  local old = M.tu_includes[tu_path]
+  if not old then return end
+  for _, e in ipairs(old) do
+    local bn = basename_of(e.name)
+    local list = M.header_users[bn]
+    if list then
+      for i = #list, 1, -1 do
+        if list[i] == tu_path then table.remove(list, i) end
+      end
+      if #list == 0 then M.header_users[bn] = nil end
+    end
+  end
+end
+
+local function set_tu_includes(tu_path, incs, observed_order)
+  unindex_tu(tu_path)
+  M.tu_includes[tu_path] = incs
+  M.tu_mtime[tu_path] = observed_order
   for _, e in ipairs(incs) do
     local bn = basename_of(e.name)
     local list = M.header_users[bn]
@@ -40,14 +104,14 @@ local function record_users(tu_path, incs)
     for _, p in ipairs(list) do if p == tu_path then found = true; break end end
     if not found then table.insert(list, tu_path) end
   end
+  if observed_order > lru_seq then lru_seq = observed_order end
 end
 
 function M.observe_tu(tu_path, source_text)
   local incs = parse_text(source_text)
-  M.tu_includes[tu_path] = incs
   lru_seq = lru_seq + 1
-  M.tu_mtime[tu_path] = lru_seq
-  record_users(tu_path, incs)
+  set_tu_includes(tu_path, incs, lru_seq)
+  emit_change()
 end
 
 function M.observe_tu_from_disk(tu_path)
@@ -59,7 +123,104 @@ function M.observe_tu_from_disk(tu_path)
 end
 
 function M.invalidate(tu_path)
+  local had_persisted_entry = is_tu_path(tu_path) and M.tu_includes[tu_path] ~= nil
+  unindex_tu(tu_path)
   M.tu_includes[tu_path] = nil
+  M.tu_mtime[tu_path] = nil
+  if is_header_path(tu_path) then M._path_cache[basename_of(tu_path)] = nil end
+  if had_persisted_entry then emit_change() end
+end
+
+local function stat_signature(path)
+  local st = vim.uv.fs_stat(path)
+  if not st or st.type ~= "file" then return nil end
+  return {
+    size = st.size,
+    mtime_sec = st.mtime and st.mtime.sec or 0,
+    mtime_nsec = st.mtime and st.mtime.nsec or 0,
+  }
+end
+
+function M.snapshot()
+  local tus = {}
+  for tu, incs in pairs(M.tu_includes) do
+    if is_tu_path(tu) then
+      table.insert(tus, {
+        path = tu,
+        includes = incs,
+        observed_order = M.tu_mtime[tu] or 0,
+      })
+    end
+  end
+  table.sort(tus, function(a, b) return a.observed_order > b.observed_order end)
+  local entries = {}
+  for i, tu in ipairs(tus) do
+    if i > PROJECT_SCAN_LIMIT then break end
+    local sig = stat_signature(tu.path)
+    if sig then
+      table.insert(entries, {
+        path = tu.path,
+        includes = clone_includes(tu.includes),
+        size = sig.size,
+        mtime_sec = sig.mtime_sec,
+        mtime_nsec = sig.mtime_nsec,
+        observed_order = tu.observed_order,
+      })
+    end
+  end
+  return { version = 1, created_at = os.time(), lru_seq = lru_seq, tus = entries }
+end
+
+local function valid_include(e)
+  return type(e) == "table"
+      and type(e.name) == "string"
+      and (e.kind == '"' or e.kind == "<")
+      and type(e.line) == "number"
+      and type(e.raw) == "string"
+end
+
+local function valid_cache_entry(entry)
+  if type(entry) ~= "table"
+      or type(entry.path) ~= "string"
+      or type(entry.size) ~= "number"
+      or type(entry.mtime_sec) ~= "number"
+      or type(entry.mtime_nsec) ~= "number"
+      or type(entry.observed_order) ~= "number"
+      or type(entry.includes) ~= "table" then
+    return false
+  end
+  for _, inc in ipairs(entry.includes) do
+    if not valid_include(inc) then return false end
+  end
+  return true
+end
+
+function M.restore_snapshot(snapshot)
+  if type(snapshot) ~= "table"
+      or snapshot.version ~= 1
+      or type(snapshot.lru_seq) ~= "number"
+      or type(snapshot.tus) ~= "table" then
+    return { loaded = 0, dropped = 0, unsupported = snapshot ~= nil }
+  end
+  local loaded, dropped = 0, 0
+  for _, entry in ipairs(snapshot.tus) do
+    if not valid_cache_entry(entry) then
+      dropped = dropped + 1
+    else
+      local sig = stat_signature(entry.path)
+      if not sig
+          or sig.size ~= entry.size
+          or sig.mtime_sec ~= entry.mtime_sec
+          or sig.mtime_nsec ~= entry.mtime_nsec then
+        dropped = dropped + 1
+      else
+        set_tu_includes(entry.path, clone_includes(entry.includes), entry.observed_order)
+        loaded = loaded + 1
+      end
+    end
+  end
+  if snapshot.lru_seq > lru_seq then lru_seq = snapshot.lru_seq end
+  return { loaded = loaded, dropped = dropped, unsupported = false }
 end
 
 local function companion_tu(header_path)
