@@ -735,7 +735,7 @@ end
 -- ====================================================================
 local handlers_installed = false
 
-function M.install_handlers(get_state_for_uri, all_states)
+function M.install_handlers(get_state_for_uri, all_states, on_unattached_diagnostics)
   if handlers_installed then return end
   handlers_installed = true
 
@@ -748,6 +748,13 @@ function M.install_handlers(get_state_for_uri, all_states)
         local st = get_state_for_uri(result.uri)
         if st then
           result.diagnostics = process_diagnostics(result.diagnostics or {}, st)
+        elseif on_unattached_diagnostics
+            and is_header_path(path)
+            and graph.is_self_contained_header(path)
+            and #(result.diagnostics or {}) > 0 then
+          vim.schedule(function()
+            on_unattached_diagnostics(cli, path, result.uri)
+          end)
         end
         -- Companion's first publishDiagnostics means its PCH is ready.
         -- Fire the callback once so init.lua can re-issue any header that
@@ -945,7 +952,13 @@ function M.wrap_client(client, ctx)
             return params and orig_notify(self, method, params)
           end
           local force = ctx.consume_forced and ctx.consume_forced(td.uri) or false
-          local includer = find_header_includer(ctx, path, td.uri, force)
+          local diagnostic_retry = ctx.is_diagnostic_self_contained and ctx.is_diagnostic_self_contained(td.uri)
+          if not force and not diagnostic_retry and graph.is_self_contained_header(path) then
+            local st = ctx.get_state_for_uri(td.uri)
+            if st and ctx.on_header_detached then ctx.on_header_detached(st) end
+            return params and orig_notify(self, method, params)
+          end
+          local includer = find_header_includer(ctx, path, td.uri, force or diagnostic_retry)
           if includer then
             local bn = vim.fn.bufnr(path)
             if bn > 0 then

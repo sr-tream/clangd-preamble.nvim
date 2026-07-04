@@ -5,6 +5,7 @@ local MAX_PREAMBLE_LINES = 1500
 local MAX_PREAMBLE_BYTES = 64 * 1024
 local PROJECT_SCAN_LIMIT = 2000
 local CYCLE_CHECK_DEPTH = 1
+local INDIRECT_INCLUDE_DEPTH = 2
 local HEADER_EXTS = {
   h = true, hh = true, hpp = true, hxx = true,
   inl = true, inc = true, ipp = true, tcc = true, tpp = true,
@@ -17,10 +18,14 @@ M.tu_includes  = {}
 M.header_users = {}
 M.tu_mtime     = {}
 M._path_cache  = {}
+M._file_include_cache = {}
 local lru_seq = 0
 local change_listeners = {}
 local build_prefix
 local header_is_self_contained
+local find_header_path
+local file_includes
+local indirect_candidates
 
 local function parse_text(text)
   local out = {}
@@ -69,6 +74,12 @@ function M.on_change(cb)
   }
 end
 
+function M.set_indirect_include_depth(value)
+  local n = tonumber(value)
+  if not n then return end
+  INDIRECT_INCLUDE_DEPTH = math.max(0, math.floor(n))
+end
+
 local function clone_includes(incs)
   local out = {}
   for _, e in ipairs(incs or {}) do
@@ -94,6 +105,7 @@ end
 
 local function set_tu_includes(tu_path, incs, observed_order)
   unindex_tu(tu_path)
+  M._file_include_cache[tu_path] = nil
   M.tu_includes[tu_path] = incs
   M.tu_mtime[tu_path] = observed_order
   for _, e in ipairs(incs) do
@@ -127,7 +139,13 @@ function M.invalidate(tu_path)
   unindex_tu(tu_path)
   M.tu_includes[tu_path] = nil
   M.tu_mtime[tu_path] = nil
-  if is_header_path(tu_path) then M._path_cache[basename_of(tu_path)] = nil end
+  M._file_include_cache[tu_path] = nil
+  if is_header_path(tu_path) then
+    local basename = basename_of(tu_path)
+    for key, _ in pairs(M._path_cache) do
+      if key:sub(-#basename - 1) == "\0" .. basename then M._path_cache[key] = nil end
+    end
+  end
   if had_persisted_entry then emit_change() end
 end
 
@@ -304,6 +322,56 @@ local function observed_candidates(header_path)
   return sort_candidates(out)
 end
 
+local function path_cache_key(basename, root)
+  return root .. "\0" .. basename
+end
+
+find_header_path = function(basename, root)
+  local key = path_cache_key(basename, root)
+  local cached = M._path_cache[key]
+  if cached ~= nil then return cached or nil end
+  local found = vim.fs.find(basename, { path = root, type = "file", limit = 1 })
+  local path = (found and found[1]) or false
+  M._path_cache[key] = path
+  return path or nil
+end
+
+file_includes = function(path)
+  if M.tu_includes[path] then return M.tu_includes[path] end
+  if M._file_include_cache[path] then return M._file_include_cache[path] end
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local text = f:read("*a"); f:close()
+  local incs = parse_text(text)
+  M._file_include_cache[path] = incs
+  return incs
+end
+
+local function resolve_include_path(from_path, entry, root)
+  if entry.kind == '"' then
+    local dir = vim.fs.dirname(from_path) or "."
+    local local_path = entry.name:sub(1, 1) == "/" and entry.name or (dir .. "/" .. entry.name)
+    local st = vim.uv.fs_stat(local_path)
+    if st and st.type == "file" then return local_path end
+  end
+  if not is_header_path(entry.name) then return nil end
+  return find_header_path(basename_of(entry.name), root)
+end
+
+local function normalize_path(path)
+  return vim.fn.fnamemodify(path, ":p")
+end
+
+local function same_path(a, b)
+  return normalize_path(a) == normalize_path(b)
+end
+
+local function include_entry_matches_header(from_path, entry, header_path, root)
+  local resolved = resolve_include_path(from_path, entry, root)
+  if resolved then return same_path(resolved, header_path) end
+  return basename_of(entry.name) == basename_of(header_path)
+end
+
 local function normalize_find_options(options)
   if type(options) == "table" then return options end
   return { force = options == true }
@@ -320,7 +388,9 @@ function M.find_includer(header_path, options)
   end
   local observed = observed_candidates(header_path)
   if #observed > 0 then return observed[1] end
-  return companion_candidate(header_path)
+  local comp = companion_candidate(header_path)
+  if comp then return comp end
+  return indirect_candidates(header_path)[1]
 end
 
 function M.find_recent_includer(header_path, options)
@@ -347,26 +417,20 @@ function M.list_includers(header_path, options)
     end
     if not seen then table.insert(out, comp) end
   end
+  local only_companion = #out > 0
+  for _, candidate in ipairs(out) do
+    if candidate.companion ~= true then only_companion = false; break end
+  end
+  if #out == 0 or only_companion then
+    for _, c in ipairs(indirect_candidates(header_path)) do
+      local seen = false
+      for _, candidate in ipairs(out) do
+        if candidate.tu_path == c.tu_path then seen = true; break end
+      end
+      if not seen then table.insert(out, c) end
+    end
+  end
   return sort_candidates(out)
-end
-
-local function find_header_path(basename, root)
-  local cached = M._path_cache[basename]
-  if cached ~= nil then return cached or nil end
-  local found = vim.fs.find(basename, { path = root, type = "file", limit = 1 })
-  local path = (found and found[1]) or false
-  M._path_cache[basename] = path
-  return path or nil
-end
-
-local function file_includes(path)
-  if M.tu_includes[path] then return M.tu_includes[path] end
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local text = f:read("*a"); f:close()
-  local incs = parse_text(text)
-  M.tu_includes[path] = incs
-  return incs
 end
 
 -- True if a header named `start_bn` (transitively, up to depth) #include's `target_bn`.
@@ -388,6 +452,103 @@ local function transitively_includes(start_bn, target_bn, root, depth, seen)
   return false
 end
 
+local function append_filtered_prefix(includes, stop, header_basename, root, state)
+  for i = 1, stop do
+    local e = includes[i]
+    local prefix_bn = basename_of(e.name)
+    if prefix_bn ~= header_basename
+       and not transitively_includes(prefix_bn, header_basename, root, CYCLE_CHECK_DEPTH, {}) then
+      local raw = e.raw
+      local next_bytes = state.bytes + #raw + 1
+      if #state.lines >= MAX_PREAMBLE_LINES or next_bytes > MAX_PREAMBLE_BYTES then break end
+      state.bytes = next_bytes
+      table.insert(state.lines, raw)
+    end
+  end
+end
+
+local function clone_prefix_state(state)
+  return { lines = vim.list_extend({}, state.lines), bytes = state.bytes }
+end
+
+local function find_indirect_match_in_file(current_path, includes, header_path, root, depth_remaining, prefix, seen, root_index, current_depth)
+  local header_basename = basename_of(header_path)
+  for i, entry in ipairs(includes) do
+    local next_prefix = clone_prefix_state(prefix)
+    append_filtered_prefix(includes, i - 1, header_basename, root, next_prefix)
+    local include_index = root_index or (i - 1)
+    local matches_target = include_entry_matches_header(current_path, entry, header_path, root)
+    if matches_target then
+      if root_index ~= nil then
+        return {
+          prefix_lines = next_prefix.lines,
+          include_index = include_index,
+          include_depth = current_depth + 1,
+        }
+      end
+    elseif depth_remaining > 1 then
+      local resolved = resolve_include_path(current_path, entry, root)
+      if resolved and is_header_path(resolved) and not seen[resolved] then
+        local child_includes = file_includes(resolved)
+        if child_includes then
+          seen[resolved] = true
+          local found = find_indirect_match_in_file(
+            resolved,
+            child_includes,
+            header_path,
+            root,
+            depth_remaining - 1,
+            next_prefix,
+            seen,
+            include_index,
+            current_depth + 1
+          )
+          seen[resolved] = nil
+          if found then return found end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function indirect_candidate_from_tu(tu_path, header_path)
+  if INDIRECT_INCLUDE_DEPTH < 2 or not is_tu_path(tu_path) then return nil end
+  local tu_inc = M.tu_includes[tu_path]
+  if not tu_inc then return nil end
+  local root = project_root_for_tu(tu_path)
+  local found = find_indirect_match_in_file(
+    tu_path,
+    tu_inc,
+    header_path,
+    root,
+    INDIRECT_INCLUDE_DEPTH,
+    { lines = {}, bytes = 0 },
+    { [tu_path] = true },
+    nil,
+    0
+  )
+  if not found or #found.prefix_lines == 0 then return nil end
+  return {
+    tu_path = tu_path,
+    prefix_lines = found.prefix_lines,
+    direct = false,
+    include_index = found.include_index,
+    observed_order = M.tu_mtime[tu_path] or 0,
+    companion = false,
+    include_depth = found.include_depth,
+  }
+end
+
+indirect_candidates = function(header_path)
+  local out = {}
+  for tu, _ in pairs(M.tu_includes) do
+    local candidate = indirect_candidate_from_tu(tu, header_path)
+    if candidate then table.insert(out, candidate) end
+  end
+  return sort_candidates(out)
+end
+
 build_prefix = function(tu_path, header_basename, root)
   local tu_inc = M.tu_includes[tu_path]
   if not tu_inc then return nil, false end
@@ -395,21 +556,10 @@ build_prefix = function(tu_path, header_basename, root)
   for i, e in ipairs(tu_inc) do
     if basename_of(e.name) == header_basename then cut = i; break end
   end
-  local lines = {}
-  local total_bytes = 0
   local stop = cut and (cut - 1) or #tu_inc
-  for i = 1, stop do
-    local e = tu_inc[i]
-    local prefix_bn = basename_of(e.name)
-    if prefix_bn ~= header_basename
-       and not transitively_includes(prefix_bn, header_basename, root, CYCLE_CHECK_DEPTH, {}) then
-      local raw = e.raw
-      total_bytes = total_bytes + #raw + 1
-      if #lines >= MAX_PREAMBLE_LINES or total_bytes > MAX_PREAMBLE_BYTES then break end
-      table.insert(lines, raw)
-    end
-  end
-  return lines, cut ~= nil
+  local state = { lines = {}, bytes = 0 }
+  append_filtered_prefix(tu_inc, stop, header_basename, root, state)
+  return state.lines, cut ~= nil
 end
 
 -- A header with many own #includes is likely making a deliberate effort to be
@@ -431,6 +581,10 @@ header_is_self_contained = function(path)
   end
   f:close()
   return false
+end
+
+function M.is_self_contained_header(path)
+  return header_is_self_contained(path)
 end
 
 function M.scan_project_for_includers(root)

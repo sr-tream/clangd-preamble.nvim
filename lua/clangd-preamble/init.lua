@@ -10,7 +10,8 @@ M._disabled_uris = {}
 M._forced_uris = {}
 M._preferred_includers = {}
 M._recent_includer_uris = {}
-M._config = { default_selector = "preamble_size", graph_cache = true }
+M._diagnostic_self_contained_uris = {}
+M._config = { default_selector = "preamble_size", graph_cache = true, indirect_include_depth = 2 }
 M._autogroup = vim.api.nvim_create_augroup("ClangdPreamble", { clear = true })
 local last_active_tu_path = nil
 local graph_cache_restored_for = nil
@@ -130,6 +131,7 @@ end
 local function mark_disabled(uri)
   M._disabled_uris[uri] = true
   M._forced_uris[uri] = nil
+  M._diagnostic_self_contained_uris[uri] = nil
   clear_selection(uri)
 end
 
@@ -190,11 +192,12 @@ local function try_promote_pending(client)
       local path = vim.api.nvim_buf_get_name(bn)
       if path ~= "" and lsp.is_header_path(path) then
         local uri = vim.uri_from_fname(path)
-        if not M._disabled_uris[uri] then
+        local diagnostic_retry = M._diagnostic_self_contained_uris[uri] == true
+        if not M._disabled_uris[uri] and (diagnostic_retry or not graph.is_self_contained_header(path)) then
           local clients = vim.lsp.get_clients({ name = "clangd", bufnr = bn })
           for _, c in ipairs(clients) do
             if c.id == client.id then
-              local inc = find_header_includer(path, uri, false)
+              local inc = find_header_includer(path, uri, diagnostic_retry)
               if inc then
                 reissue_open(c, bn, path, uri)
                 lsp.send_fake_change(c, bn, uri)
@@ -264,6 +267,7 @@ end
 local function reissue_recent_header_if_changed(bufnr)
   local uri, path = uri_for_bufnr(bufnr)
   if not uri or not path or M._disabled_uris[uri] or not uses_recent_selector(uri) then return false end
+  if not M._diagnostic_self_contained_uris[uri] and graph.is_self_contained_header(path) then return false end
   local recent = graph.find_recent_includer(path, { force = true })
   if not recent then return false end
   local st = M._buf_state[bufnr]
@@ -334,6 +338,7 @@ CTX.all_states            = all_states
 CTX.is_disabled           = is_disabled
 CTX.consume_forced        = consume_forced
 CTX.find_includer         = find_header_includer
+CTX.is_diagnostic_self_contained = function(uri) return M._diagnostic_self_contained_uris[uri] == true end
 CTX.on_header_attached    = on_header_attached
 CTX.on_header_detached    = on_header_detached
 -- Promotion can be heavy (disk I/O for every pending header), so defer it
@@ -348,6 +353,17 @@ end
 -- Called by lsp.lua when the companion's first publishDiagnostics arrives,
 -- meaning clangd has built its PCH. Re-issue all headers that were analyzed
 -- before that PCH was ready.
+local function retry_self_contained_from_diagnostics(client, path, uri)
+  if M._disabled_uris[uri] or M._diagnostic_self_contained_uris[uri] then return end
+  M._diagnostic_self_contained_uris[uri] = true
+  local bn = vim.fn.bufnr(path)
+  if bn <= 0 or not vim.api.nvim_buf_is_loaded(bn) then return end
+  local inc = find_header_includer(path, uri, true)
+  if not inc then return end
+  reissue_open(client, bn, path, uri)
+  lsp.send_fake_change(client, bn, uri)
+end
+
 lsp._on_virtual_tu_ready = function(client, tu_path)
   try_refresh_existing(client, tu_path)
 end
@@ -359,6 +375,12 @@ function M.setup(opts)
   end
   if opts.graph_cache ~= nil then
     M._config.graph_cache = opts.graph_cache ~= false
+  end
+  if opts.indirect_include_depth ~= nil then
+    M._config.indirect_include_depth = math.max(0, math.floor(tonumber(opts.indirect_include_depth) or 0))
+    graph.set_indirect_include_depth(M._config.indirect_include_depth)
+  else
+    graph.set_indirect_include_depth(M._config.indirect_include_depth)
   end
   ensure_graph_cache_restored()
 end
@@ -450,7 +472,7 @@ end
 function M.attach(client, bufnr)
   if client.name ~= "clangd" then return end
   ensure_graph_cache_restored()
-  lsp.install_handlers(get_state_for_uri, all_states)
+  lsp.install_handlers(get_state_for_uri, all_states, retry_self_contained_from_diagnostics)
   if M._attached_clients[client.id] then return end
   M._attached_clients[client.id] = true
   lsp.wrap_client(client, CTX)

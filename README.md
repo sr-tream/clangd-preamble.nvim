@@ -86,6 +86,10 @@ require("clangd-preamble").setup({
   -- Persist observed/project-scanned TU include graphs under stdpath("cache")
   -- and restore entries whose file size and mtime still match.
   graph_cache = true,
+
+  -- Lazy fallback scan depth for TU -> header -> target-header chains when no
+  -- direct includer TU is known. Set to 0 to disable indirect scanning.
+  indirect_include_depth = 2,
 })
 ```
 
@@ -130,11 +134,19 @@ table.insert(opts.sections.lualine_x, 1, { clangd_preamble, color = { fg = "#7aa
    make the default follow the most recently observed includer TU.
    `:NoSelfContainedSelectIncluder` can pin a specific TU or switch the header
    to last-seen mode. Companion-TU fallback (`Foo.cpp` next to `Foo.h`) covers
-   the header-opened-alone case.
+   the header-opened-alone case. If no direct includer is known, the graph
+   lazily walks observed TU include chains up to `indirect_include_depth` and
+   can build a preamble from the includes before the chain that reaches the
+   target header. Direct includers always win, so indirect chains are not
+   searched while a direct TU candidate exists.
 3. **Self-contained skip.** Headers with **3 or more own `#include`
    directives** are likely self-contained and skipped automatically — the
    preamble can only introduce conflicts in that case. Manual commands
-   (`:NoSelfContainedRefresh`, `:NoSelfContainedEnableBuf`) override.
+   (`:NoSelfContainedRefresh`, `:NoSelfContainedEnableBuf`) override. Skipped
+   headers do not get plugin state, so statusline integrations based on
+   `includer_for()` stay hidden. If such a skipped header later publishes
+   clangd diagnostics, it is treated as non-self-contained and replayed through
+   the normal includer search.
 4. **Cycle filter.** Each prefix entry is checked (1 level deep) against the
    target header's basename — entries that transitively re-include the
    target are dropped to prevent redefinition cascades.
